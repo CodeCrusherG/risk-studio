@@ -1,0 +1,150 @@
+# Design
+
+## Source of truth
+- Status: Active
+- Last refreshed: 2026-09-17
+- Primary product surfaces: local Risk Studio credit-risk-agent workbench, V2 workflow task entries, Agent-driven plan/gate execution, model-validation compatibility flow, structured evidence, downloads/reports, audit history, Agent memory, and runtime branding.
+- Evidence reviewed: current `README.md`, `README.md`, `docs/roadmap.md`, `docs/versioning.md`, `docs/branding.md`, `docs/notebook_contract.md`, `docs/runbook.md`, and the static FastAPI-served frontend.
+- Roadmap reference: use `docs/roadmap.md` for version phases and Plugin/Tool/Hook/Workflow terminology. Keep this file focused on product experience and interface decisions.
+
+## Brand
+- Personality: restrained local professional tool, closer to Xcode or Finder utility panels than SaaS landing pages.
+- Trust signals: clear task state, human-readable execution evidence, stable report output paths, visible errors near the triggering action, and auditable Agent statements.
+- Avoid: marketing hero pages, full-page or purely decorative glass effects, heavy
+  shadows without hierarchy, redundant rails, generic AI claims, and JSON as
+  the default user-facing result. Functional workflow widgets may use the
+  controlled glass treatment defined below when translucency communicates
+  grouping, progress, filtering, or drill-down behavior.
+- Default public brand: `Risk Studio — AI Risk Management Agent`.
+- Branding must be runtime-configurable without source-code edits. The configurable surface is logo, favicon/web logo, primary theme color, platform display name, and browser page title.
+- Private/customer branding belongs in `workspace/branding/brand.json` plus sibling assets, and must not be required for the open-source checkout to run.
+- When no branding config exists, the platform uses the public Risk Studio defaults: neutral charcoal primary color and the built-in Risk Studio logo/favicon.
+
+## Product goals
+- Goals: make Risk Studio a local-first credit-risk agent that assists governed validation, modeling, analysis, strategy, and monitoring work through structured workflows.
+- Current V2 goal: let users run real credit-risk workflows for data processing, feature analysis, model development, model validation, strategy, Vintage/risk analysis, monitoring, and portfolio-style analysis through governed Agent conversations and structured controls.
+- Compatibility goal: keep model validation stable and demonstrable through task creation, material scanning, notebook execution, deterministic validation evidence, Agent explanations, report conclusion confirmation, and Excel/Word output.
+- Memory goal: let Agent use auditable cross-task memory for user preferences, field conventions, validation/modeling/strategy pitfalls, task experience, model experience, and workflow experience while preserving deterministic results.
+- Runtime goal: let Agent understand a user goal, plan with available plugins/tools/hooks, execute controlled Python capabilities, and return structured evidence, artifacts, and report content.
+- Non-goals: marketing homepage, arbitrary unreviewed code execution, report styling rewrites unrelated to structured task output, hidden memory use, or overclaiming unsupported workflows before their plugins exist.
+- Success signals: one obvious next action, evidence readable without code knowledge, Agent explanations traceable to current evidence or memory references, and generated reports grounded in structured results.
+
+## Personas and jobs
+- Primary personas: credit-risk modelers, risk analysts, strategy operators, and model validation staff who can operate a local web tool but should not need to read raw JSON or manually wire scripts together.
+- Current user jobs: join and clean datasets, analyze features, train and compare models, validate submitted models, design and backtest strategies, inspect Vintage/risk signals, run monitoring or portfolio-style analysis, and export auditable reports/artifacts.
+- Memory-backed user jobs: receive useful historical reminders inside Agent analysis, understand whether a new result improved or declined compared with comparable historical work, reuse known field conventions and pitfalls, and manage memory entries when needed.
+- Future user jobs: scheduled monitoring, multi-user review/approval, real-time scoring handoff, stronger portfolio management loops, and governed third-party workflow packs.
+- Key contexts of use: local Jupyter terminal / notebook proxy, internal network, repeated credit-risk analysis and validation tasks.
+
+## Information architecture
+- Primary navigation: brand-configurable left task sidebar with platform title, task list, task search, create action, and settings for sort/group/theme.
+- Core current screen: resizable workbench with task navigation on the left, the current working object in the center, and execution steps on the right. Agent model validation has task-local Conversation / Evidence / Report views. The manual validation document canvas remains available in its existing flow.
+- Agent surface: center-column conversation that sits with task evidence, not as a detached chatbot unrelated to the current task.
+- Memory surface: memory should appear inside Agent explanations, warnings, comparison summaries, report-draft rationale, and workflow choices. Do not add a fixed top/center memory block that lists matched memories.
+- Memory management surface: settings or audit management view for listing, inspecting, disabling, deleting, and exporting memory audit records. It is not a default task dashboard panel.
+- Plugin/tool surface: plugin/tool execution output should appear as native evidence sections, tables, charts, findings, and report sections.
+
+## Design principles
+- Principle 1: keep creation-time configuration in the create-task dialog, including manual/Agent mode selection.
+- Principle 2: preserve the current model and task context when moving between conversation, evidence and report editing. Agent report drafts use an editable table in the central Report view, with a persistent save state and confirmation action; the conversation holds a short link to that view.
+- Principle 3: default to human-readable summaries; raw data stays available behind details.
+- Principle 4: every Agent statement should be grounded in current task evidence, explicit memory references, or clearly labeled general explanation.
+- Principle 5: extension output must look native. A plugin/tool may add a table, chart, finding, or report section, but it should not introduce a separate visual language or bypass platform rendering.
+- Tradeoffs: compact internal-tool density over decorative presentation; auditability over conversational smoothness when the two conflict.
+
+## Visual language
+- Color: neutral light background and white panels. The default primary color is neutral charcoal (`#343438`); configured primary color drives primary actions such as create-task and Agent send.
+- Typography: system font, 12 / 14 / 15 / 17 / 22 / 28 size scale. Report prose uses 15px with comfortable line height; internal template keys belong in expandable details.
+- Spacing/layout rhythm: the default wide desktop shell uses a 256px task sidebar, a 278px right track (including its outer margin), and 24px column gaps. User resizing remains available, with 240px minimum tracks. Spend the recovered space on central report and evidence content.
+- Shape/radius/elevation: 8px is the base control radius. Functional workflow
+  widgets may use the documented 12 / 16 / 18 / 22px component radii to express
+  nested hierarchy; they remain border-first and use a single low-opacity
+  elevation layer.
+- Motion: generic surfaces do not translate on hover. Functional controls may
+  use color/elevation feedback and a maximum 1px pressed movement; workflow
+  widgets may use one short entrance transition. Loading state changes text,
+  progress, and spinner without moving surrounding layout.
+- Imagery/iconography: logo and favicon only for the current internal tool; avoid decorative art.
+
+## Components
+- Existing components to reuse: static FastAPI-served HTML/CSS/JS, current task/report API ids, existing task evidence sections, current Agent conversation UI.
+- Functional glass components: reusable workflow data widget, modeling journey
+  stage, progress widget, filter rail, and artifact download card. Their glass
+  treatment is scoped to the component, must carry an interaction or state,
+  and must not be used to wrap ordinary Agent prose.
+- Existing Agent components: LLM settings, center-column conversation, asymmetric user/Agent messages, staged evidence summaries, Word conclusion confirmation gate.
+- Branding components: runtime brand loader, brand config schema, sidebar logo/name binding, favicon/title binding, CSS primary-color token, and public default Risk Studio logo/favicon.
+- Memory components: inline memory-aware Agent statements, expandable memory references on Agent messages, memory management/audit view, memory disable/delete actions, and memory-use audit metadata.
+- Workflow/runtime components: plugin registry, tool run evidence panel, hook run evidence panel, workflow plan/right-rail view, extension metric tables, extension report sections, and plugin output display declarations.
+- Variants and states: primary/secondary/disabled/loading/error/success buttons; empty/loading/error/success summaries; high/medium/low confidence memory comparison states; disabled memory state; deleted-memory reference state.
+- Token/component ownership: global tokens and shell components live in
+  `marvis/static/styles.css`; V2 workflow components live in
+  `marvis/static/css/v2-workbench.css` and consume the same global tokens.
+
+## Accessibility
+- Target standard: practical WCAG AA for contrast and keyboard focus on the local tool.
+- Keyboard/focus behavior: visible `:focus-visible`, task list keyboard navigation, Enter task creation, Cmd/Ctrl+S save report text where supported.
+- Contrast/readability: muted text must remain readable on white. Sidebar task names stay on one line with ellipsis; the full name, owner, and created time appear in a hover/focus preview card to the right of the row.
+- Screen-reader semantics: status and alert areas near the relevant actions; raw data and memory references are labelled.
+- Reduced motion and sensory considerations: no layout-shifting hover motion;
+  entrance and progress animation must stop under `prefers-reduced-motion`.
+
+## Responsive behavior
+- Current supported QA scope: wide desktop at 1440, 1600 and 1920 CSS pixels. Narrow/mobile adaptations require a separate explicit product decision; existing fallback CSS is not a claim of verified mobile support.
+- Layout adaptations: preserve resizable desktop columns and internal horizontal scrolling for the model switcher. Additional models must not widen the status bar or the page.
+- Touch/hover differences: controls must work without hover-only affordances.
+
+## Interaction states
+- Loading: action buttons show busy text and disable conflicting actions.
+- Empty: tells the user what to do next, not just what is missing.
+- Error: shown near the action bar and in the affected result section when possible.
+- Success: summary panel shows output or evidence in human-readable form.
+- Disabled: buttons carry titles explaining why they cannot be used.
+- Offline/slow network: long notebook/report actions remain visibly busy.
+- Memory comparison uncertainty: medium-confidence matches must be textually marked as requiring human confirmation. Low-confidence matches should not be used for historical comparison.
+
+## Validation editing and creation
+- Each model owns a draft buffer keyed by task ID and draft version. Autosave writes narrative fields to the local task database. It neither confirms the report nor changes metrics, task execution or Agent memory. Never persist report prose in browser storage.
+- Distinguish draft saving from report confirmation. Show pending, saving, saved, failed and conflict states. A stale write must fail visibly, preserve edits and offer a version comparison; a draft confirmed in another window must not silently discard this window's changes.
+- Confirmation binds the report revision, draft message ID and edit revision. Batch confirmation flushes all edited pending models first; its visible scope includes pending, failed, cancelled and unready models. Report confirmation means consent to generate documents, not that a model passed validation.
+- Creation starts with names and materials. Background narratives are optional expandable fields, empty until supplied; examples are placeholders, never assumed business facts. Keep required data dictionary and execution contracts intact.
+- Use one selected execution mode. Single-model creation prefers Agent when a model is configured, otherwise manual. Multiple-model validation always uses the existing automatic Agent workbench and explains that choice.
+- Collapse previous model details when adding another model. Keep the total, material-selection summary and create action visible in a fixed footer; validation errors reveal the relevant model without clearing other inputs.
+- Completed step groups collapse by default; active and exceptional groups expand. Respect the user's subsequent expansion choice per model. Preserve task-local view and scroll positions during navigation.
+- The model switcher is a radiogroup with an accessible model/status label, one checked value, roving focus, and Arrow / Home / End navigation.
+
+## Strategy navigation and visual restraint
+- Use the existing seven workflow stages to filter relevant tools. Search addresses all tools; expert access and contextual candidate actions preserve their original governed handlers and evidence bindings.
+- Collapse empty analysis categories, empty history and empty evidence details. Keep existing results accessible and expose structural risk flags; empty tasks must not show fictitious execution progress.
+- Primary action labels use business language. Precise Tool, version, hash, action and provenance details remain available for inspection.
+- Default task rows are compact and quiet; selected state carries the emphasis. Preserve single-line names, full hover/focus previews and keyboard access to delete.
+- Common small/medium/large radii are 8/12/16px. Ordinary controls use subtle borders and restrained shadows; avoid hover translation. During task work, the chosen pet is small, stationary and docked outside the working content; retain user branding and welcome-screen preferences.
+
+## Content voice
+- Tone: concise operational Chinese in the product UI.
+- Terminology: use "Materials", "Notebook", "Report case", "Word Report", "Historical comparison", "Memory Reference"; avoid backend lifecycle labels as UI labels.
+- Microcopy rules: no double-language eyebrow; no README-style explanatory paragraphs in every section; Agent should distinguish current evidence, historical memory, and general domain guidance. Memory should sound like operational guidance, not a separate "AI memory found X" system notice.
+
+## Implementation constraints
+- Framework/styling system: plain HTML/CSS/JS served by FastAPI. `styles.css`
+  owns shared tokens and compatibility rules; feature-scoped styles live under
+  `static/css/` and are loaded through the tested immutable stylesheet bundle.
+- Design-token constraints: no new frontend dependency; keep proxy-safe relative paths.
+- Branding config should live outside committed source defaults under `workspace/branding/`.
+- Performance constraints: avoid unnecessary `backdrop-filter`, heavy shadows,
+  and repeated DOM rewrites during polling. Controlled glass is limited to
+  functional workflow components, capped at 22px blur, and must retain an
+  opaque fallback/background for unsupported or reduced-motion environments.
+- Compatibility constraints: preserve existing API endpoints and legacy DOM ids used by tests unless a task explicitly migrates them.
+- Test/screenshot expectations: smoke tests plus browser viewport verification after frontend changes.
+- Memory constraints: memory can support explanation, comparison, field suggestions, pitfall warnings, report wording, and future workflow planning, but cannot alter deterministic validation metrics. Memory references must carry source, category, confidence, and audit metadata.
+- Plugin constraints: plugin/tool/hook outputs must return structured results; platform owns Word/Excel/chart rendering.
+
+## Open questions
+- [ ] Memory management UI placement: settings modal first, then dedicated audit screen if volume requires it.
+- [ ] Plugin upload UI: administrator-only, ordinary user with confirmation, or local developer-only for public builds.
+- [x] Portfolio exposure: Portfolio Analysis is a governed first-screen task.
+  Its currently verified public slice is the no-trend local workflow; production
+  monitoring remains embedded in modeling/strategy and must not be advertised
+  as a delivered standalone operations service.
+- [ ] V2 multi-user governance: design maker-checker, role permissions, approval exports, production-operation confirmation, and recovery UX; the version scope is decided, only the interaction design remains open.
