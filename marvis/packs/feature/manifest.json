@@ -1,0 +1,1528 @@
+{
+  "name": "feature",
+  "version": "0.5.0",
+  "display_name": "Feature Engineering Pack",
+  "description": "Evaluate, select, bin, encode, transform, and derive model features.",
+  "module": "marvis.packs.feature.tools",
+  "python_requires": ">=3.10,<3.14",
+  "tools": [
+    {
+      "name": "compute_feature_metrics",
+      "summary": "Calculate feature IV, KS, AUC, PSI, lift, and coverage.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "features": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 0
+          },
+          "target_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "bins": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "compare_dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "metrics": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "meaning_directions": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "business_meaning": {
+                  "type": "string"
+                },
+                "expected_direction": {
+                  "type": "string",
+                  "enum": [
+                    "positive",
+                    "negative",
+                    "u_shape",
+                    "uncertain"
+                  ]
+                },
+                "confidence": {
+                  "type": "string",
+                  "enum": [
+                    "high",
+                    "medium",
+                    "low"
+                  ]
+                },
+                "rationale": {
+                  "type": "string"
+                },
+                "judgement_source": {
+                  "type": "string"
+                },
+                "model": {
+                  "type": "string"
+                },
+                "prompt_name": {
+                  "type": "string"
+                },
+                "prompt_version": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "business_meaning",
+                "expected_direction",
+                "confidence",
+                "rationale",
+                "judgement_source",
+                "model",
+                "prompt_name",
+                "prompt_version"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "time_col": {
+            "type": "string"
+          },
+          "split_col": {
+            "type": "string"
+          },
+          "corr_threshold": {
+            "type": "number"
+          },
+          "drop_nan_labels": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dataset_id",
+          "features",
+          "target_col"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string"
+          },
+          "metrics": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "selected_metrics": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "collinear": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "nan_labels_dropped": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "dataset_id",
+          "metrics",
+          "selected_metrics",
+          "collinear"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_compute_feature_metrics",
+      "side_effects": [
+        "read:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "analyze_feature_bins",
+      "summary": "Calculate bin-level metrics for selected features.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "features": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 0
+          },
+          "target_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "bins": {
+            "type": "integer",
+            "minimum": 3,
+            "maximum": 20
+          },
+          "drop_nan_labels": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dataset_id",
+          "features",
+          "target_col",
+          "bins"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string"
+          },
+          "selected_features": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "requested_bins": {
+            "type": "integer",
+            "minimum": 3,
+            "maximum": 20
+          },
+          "binning": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "nan_labels_dropped": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "dataset_id",
+          "selected_features",
+          "requested_bins",
+          "binning",
+          "nan_labels_dropped"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_analyze_feature_bins",
+      "side_effects": [
+        "read:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "generate_feature_report",
+      "summary": "Export feature metrics to an Excel report.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "metrics": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "collinear": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "binning": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        },
+        "required": [
+          "metrics"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report_path": {
+            "type": "string"
+          },
+          "feature_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "metrics": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "collinear": {
+            "type": "object"
+          },
+          "binning": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        },
+        "required": [
+          "report_path",
+          "feature_count"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_generate_feature_report",
+      "side_effects": [
+        "write:artifact"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "screen_features",
+      "summary": "Select candidate features and flag suspected leakage or unusable fields.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "features": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 0
+          },
+          "target_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "target_type": {
+            "type": "string"
+          },
+          "split_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sample_weight_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "holdout_values": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "leakage_ks": {
+            "type": "number"
+          },
+          "max_missing_rate": {
+            "type": "number"
+          },
+          "top_k": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "batch_size": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "max_ks_decay": {
+            "type": "number"
+          },
+          "drop_nan_labels": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dataset_id",
+          "features",
+          "target_col"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "selected": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "ranked": {
+            "type": "array",
+            "items": {
+              "type": "array"
+            }
+          },
+          "leakage": {
+            "type": "array",
+            "items": {
+              "type": "array"
+            }
+          },
+          "suspected": {
+            "type": "array",
+            "items": {
+              "type": "array"
+            }
+          },
+          "unusable": {
+            "type": "array",
+            "items": {
+              "type": "array"
+            }
+          },
+          "scores": {
+            "type": "object"
+          },
+          "n_screened": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "nan_labels_dropped": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "excluded_categorical": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "type": "string"
+                },
+                "cardinality": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "column",
+                "cardinality"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "suspected_categorical": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {
+                  "type": "string"
+                },
+                "cardinality": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "column",
+                "cardinality"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "sentinel_columns": {
+            "type": "object"
+          },
+          "sentinel_notice": {
+            "type": "string"
+          },
+          "split_shift": {
+            "type": "array",
+            "items": {
+              "type": "array"
+            }
+          },
+          "leakage_watch": {
+            "type": "array",
+            "items": {
+              "type": "array"
+            }
+          },
+          "ks_decay_watch": {
+            "type": "array",
+            "items": {
+              "type": "array"
+            }
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "selected",
+          "ranked",
+          "leakage",
+          "suspected",
+          "unusable",
+          "scores"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 300,
+      "failure_policy": "fail",
+      "entrypoint": "tool_screen_features",
+      "side_effects": [
+        "read:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "bin_feature",
+      "summary": "Group a feature into bins and calculate WOE and IV.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "feature": {
+            "type": "string",
+            "minLength": 1
+          },
+          "target_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "equal_frequency",
+              "quantile",
+              "equal_width",
+              "manual",
+              "chimerge",
+              "tree"
+            ]
+          },
+          "max_bins": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "bins": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "breakpoints": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "enforce_monotonic": {
+            "type": "boolean"
+          },
+          "monotonic_direction": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "increasing",
+              "decreasing"
+            ]
+          },
+          "seed": {
+            "type": "integer"
+          },
+          "drop_nan_labels": {
+            "type": "boolean"
+          },
+          "sentinel_values": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "min_bin_pct": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "required": [
+          "dataset_id",
+          "feature",
+          "target_col",
+          "method"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "feature": {
+            "type": "string"
+          },
+          "method": {
+            "type": "string"
+          },
+          "bins": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "total_iv": {
+            "type": "number"
+          },
+          "monotonic": {
+            "type": "boolean"
+          },
+          "na_bin": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "monotonic_enforced": {
+            "type": "boolean"
+          },
+          "monotonic_direction": {
+            "type": "string"
+          },
+          "monotonic_before": {
+            "type": "boolean"
+          },
+          "total_iv_before_monotonic": {
+            "type": "number"
+          },
+          "edges_before_monotonic": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "nan_labels_dropped": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "feature",
+          "method",
+          "bins",
+          "edges",
+          "total_iv",
+          "monotonic",
+          "na_bin"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "stochastic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_bin_feature",
+      "side_effects": [
+        "read:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "compute_psi",
+      "summary": "Calculate feature PSI between two filtered populations.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "feature": {
+            "type": "string",
+            "minLength": 1
+          },
+          "base_filter": {
+            "type": "object"
+          },
+          "compare_filter": {
+            "type": "object"
+          },
+          "bins": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "dataset_id",
+          "feature"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string"
+          },
+          "feature": {
+            "type": "string"
+          },
+          "psi": {
+            "type": "number",
+            "minimum": 0
+          },
+          "edges": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "bin_distributions": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "dataset_id",
+          "feature",
+          "psi",
+          "edges",
+          "bin_distributions"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_compute_psi",
+      "side_effects": [
+        "read:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "correlation_analysis",
+      "summary": "Calculate correlations, identify collinear pairs, and report VIF.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "features": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "pearson",
+              "spearman"
+            ]
+          },
+          "threshold": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "required": [
+          "dataset_id",
+          "features"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string"
+          },
+          "features": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "matrix": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            }
+          },
+          "collinear_pairs": {
+            "type": "array",
+            "items": {
+              "type": "array"
+            }
+          },
+          "vif": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "dataset_id",
+          "features",
+          "matrix",
+          "collinear_pairs",
+          "vif"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_correlation_analysis",
+      "side_effects": [
+        "read:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "woe_encode",
+      "summary": "Save a dataset with WOE-encoded features and their encoding maps.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "features": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1
+          },
+          "target_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "equal_frequency",
+              "quantile",
+              "equal_width",
+              "manual",
+              "chimerge",
+              "tree"
+            ]
+          },
+          "max_bins": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "breakpoints": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "split_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "holdout_values": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allow_full_fit": {
+            "type": "boolean"
+          },
+          "seed": {
+            "type": "integer"
+          },
+          "drop_nan_labels": {
+            "type": "boolean"
+          },
+          "sentinel_values": {
+            "type": [
+              "array",
+              "object"
+            ]
+          },
+          "min_bin_pct": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "required": [
+          "dataset_id",
+          "features",
+          "target_col"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "result_dataset_id": {
+            "type": "string"
+          },
+          "new_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "woe_maps": {
+            "type": "object"
+          },
+          "nan_labels_dropped": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "fit_rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "fit_split": {
+            "type": "string",
+            "enum": [
+              "train",
+              "full"
+            ]
+          }
+        },
+        "required": [
+          "result_dataset_id",
+          "new_columns",
+          "woe_maps"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "stochastic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_woe_encode",
+      "side_effects": [
+        "read:dataset",
+        "write:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "woe_encode_categorical",
+      "summary": "Encode categories as WOE with Laplace smoothing and rare-category pooling. Unseen and missing categories use the global-prior WOE.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "features": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1
+          },
+          "target_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "min_count": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "smoothing": {
+            "type": "number"
+          },
+          "split_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "holdout_values": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allow_full_fit": {
+            "type": "boolean"
+          },
+          "drop_nan_labels": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dataset_id",
+          "features",
+          "target_col"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "result_dataset_id": {
+            "type": "string"
+          },
+          "new_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "woe_maps": {
+            "type": "object"
+          },
+          "nan_labels_dropped": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "fit_rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "fit_split": {
+            "type": "string",
+            "enum": [
+              "train",
+              "full"
+            ]
+          }
+        },
+        "required": [
+          "result_dataset_id",
+          "new_columns",
+          "woe_maps"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_woe_encode_categorical",
+      "side_effects": [
+        "read:dataset",
+        "write:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "onehot_encode",
+      "summary": "Save a dataset with one-hot encoded categorical features.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1
+          },
+          "max_categories": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "dataset_id",
+          "columns"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "result_dataset_id": {
+            "type": "string"
+          },
+          "mapping": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "result_dataset_id",
+          "mapping"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_onehot_encode",
+      "side_effects": [
+        "read:dataset",
+        "write:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "normalize",
+      "summary": "Save a dataset with min-max normalization or z-score standardization.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "minmax",
+              "zscore"
+            ]
+          },
+          "feature_range": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "split_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "holdout_values": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allow_full_fit": {
+            "type": "boolean"
+          },
+          "sentinel_values": {
+            "type": [
+              "array",
+              "object"
+            ]
+          }
+        },
+        "required": [
+          "dataset_id",
+          "columns",
+          "method"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "result_dataset_id": {
+            "type": "string"
+          },
+          "scaler_params": {
+            "type": "object"
+          },
+          "fit_rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "fit_split": {
+            "type": "string",
+            "enum": [
+              "train",
+              "full"
+            ]
+          }
+        },
+        "required": [
+          "result_dataset_id",
+          "scaler_params"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_normalize",
+      "side_effects": [
+        "read:dataset",
+        "write:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "impute_missing",
+      "summary": "Fill missing values and retain the fill values for reuse.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1
+          },
+          "strategy": {
+            "type": "string",
+            "enum": [
+              "mean",
+              "median",
+              "mode",
+              "constant"
+            ]
+          },
+          "fill_value": {},
+          "split_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "holdout_values": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allow_full_fit": {
+            "type": "boolean"
+          },
+          "sentinel_values": {
+            "type": [
+              "array",
+              "object"
+            ]
+          },
+          "add_indicators": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dataset_id",
+          "columns",
+          "strategy"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "result_dataset_id": {
+            "type": "string"
+          },
+          "fill_values": {
+            "type": "object"
+          },
+          "fit_rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "fit_split": {
+            "type": "string",
+            "enum": [
+              "train",
+              "full"
+            ]
+          },
+          "indicator_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "result_dataset_id",
+          "fill_values"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_impute_missing",
+      "side_effects": [
+        "read:dataset",
+        "write:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "cap_outliers",
+      "summary": "Cap numeric outliers and retain the applied bounds.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "iqr",
+              "quantile"
+            ]
+          },
+          "lower_q": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "upper_q": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "split_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "holdout_values": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allow_full_fit": {
+            "type": "boolean"
+          },
+          "sentinel_values": {
+            "type": [
+              "array",
+              "object"
+            ]
+          }
+        },
+        "required": [
+          "dataset_id",
+          "columns"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "result_dataset_id": {
+            "type": "string"
+          },
+          "bounds": {
+            "type": "object"
+          },
+          "fit_rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "fit_split": {
+            "type": "string",
+            "enum": [
+              "train",
+              "full"
+            ]
+          }
+        },
+        "required": [
+          "result_dataset_id",
+          "bounds"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_cap_outliers",
+      "side_effects": [
+        "read:dataset",
+        "write:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "cross_features",
+      "summary": "Derive features from explicit formulas. Aggregations require a split column or permission to fit on the full dataset.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "recipe": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "minItems": 1
+          }
+        },
+        "required": [
+          "dataset_id",
+          "recipe"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "result_dataset_id": {
+            "type": "string"
+          },
+          "new_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "result_dataset_id",
+          "new_columns"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_cross_features",
+      "side_effects": [
+        "read:dataset",
+        "write:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "derive_date_features",
+      "summary": "Derive date differences, month values, or tenure in months from selected date columns.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "recipe": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "minItems": 1
+          }
+        },
+        "required": [
+          "dataset_id",
+          "recipe"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "result_dataset_id": {
+            "type": "string"
+          },
+          "new_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "result_dataset_id",
+          "new_columns"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_derive_date_features",
+      "side_effects": [
+        "read:dataset",
+        "write:dataset"
+      ],
+      "memory_limit_mb": 4096
+    }
+  ],
+  "hooks": [],
+  "permissions": [
+    "read:dataset",
+    "write:dataset",
+    "write:artifact"
+  ]
+}
