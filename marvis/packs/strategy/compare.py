@@ -1,0 +1,156 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import pandas as pd
+
+from marvis.packs.strategy.backtest import backtest_strategy, strategy_approval_mask
+from marvis.packs.strategy.contracts import Strategy
+from marvis.packs.strategy.errors import StrategyError
+from marvis.packs.strategy.profit import ProfitParams
+
+
+@dataclass(frozen=True)
+class CompareCell:
+    count: int
+    bad_rate: float | None
+
+
+@dataclass(frozen=True)
+class CompareResult:
+    matrix_2x2: dict[str, CompareCell]
+    deltas: dict[str, float]
+    summary_text: str
+    red_flags: tuple[dict, ...]
+
+
+def compare_strategies(
+    df: pd.DataFrame,
+    strategy: Strategy,
+    baseline: Strategy,
+    *,
+    target_col: str,
+    profit_params: ProfitParams | None = None,
+    ead_col: str | None = None,
+    pd_col: str | None = None,
+) -> CompareResult:
+    """Deterministic 2x2 approve/decline agreement matrix between a candidate and
+    a baseline strategy, plus approval/bad-rate/profit deltas. Reuses the shared
+    backtest core for the aggregate deltas so numbers match backtest_strategy
+    exactly; the 2x2 cells are computed here from the two decision vectors."""
+    if strategy.strategy_type != baseline.strategy_type:
+        raise StrategyError("strategy comparison requires matching strategy types")
+    if strategy.strategy_type not in {"approval", "reject"}:
+        raise StrategyError(
+            f"typed comparison is not yet available for {strategy.strategy_type}"
+        )
+    _assert_columns(df, [target_col])
+    target = pd.to_numeric(df[target_col], errors="raise").astype(int)
+    new_approved = strategy_approval_mask(df, strategy)
+    base_approved = strategy_approval_mask(df, baseline)
+
+    matrix = {
+        "both_approve": _cell(target, new_approved & base_approved),
+        "only_new": _cell(target, new_approved & ~base_approved),
+        "only_baseline": _cell(target, ~new_approved & base_approved),
+        "both_decline": _cell(target, ~new_approved & ~base_approved),
+    }
+
+    new_result = backtest_strategy(
+        df, strategy, target_col=target_col, baseline=baseline,
+        profit_params=profit_params, ead_col=ead_col, pd_col=pd_col,
+    )
+    base_result = backtest_strategy(
+        df, baseline, target_col=target_col,
+        profit_params=profit_params, ead_col=ead_col, pd_col=pd_col,
+    )
+    # FIN-3 #4: expected_profit is None when a profit backtest was requested but the
+    # pd_col/ead_col EL-chain inputs were missing (backtest_strategy degrades gracefully
+    # rather than raising). The profit delta is then undefined -> None, not a fake 0.0.
+    profit_available = (
+        new_result.expected_profit is not None and base_result.expected_profit is not None
+    )
+    deltas = {
+        "approval_rate": float(new_result.approval_rate - base_result.approval_rate),
+        "approved_bad_rate": float(new_result.approved_bad_rate - base_result.approved_bad_rate),
+        "expected_profit": (
+            float(new_result.expected_profit - base_result.expected_profit)
+            if profit_available
+            else None
+        ),
+    }
+
+    red_flags: list[dict] = []
+    swap_in = matrix["only_new"]
+    swap_out = matrix["only_baseline"]
+    if (
+        swap_in.count
+        and swap_out.count
+        and swap_in.bad_rate is not None
+        and swap_out.bad_rate is not None
+        and swap_in.bad_rate > swap_out.bad_rate
+    ):
+        red_flags.append(
+            {
+                "code": "swap_in_worse",
+                "level": "red",
+                "message": (
+                    f"swap-in Bad rate{swap_in.bad_rate:.4f} Higherswap-out Bad rate"
+                    f"{swap_out.bad_rate:.4f},The new strategy is changing the audience even worse."
+                ),
+            }
+        )
+    if deltas["expected_profit"] is not None and deltas["expected_profit"] < 0:
+        red_flags.append(
+            {
+                "code": "profit_negative_delta",
+                "level": "amber",
+                "message": (
+                    f"Expected profits are lower than baseline{abs(deltas['expected_profit']):.2f}."
+                ),
+            }
+        )
+
+    profit_delta = deltas["expected_profit"]
+    profit_text = (
+        # FIN-3 #4: profit delta is None when the EL chain lacked pd_col/ead_col.
+        "Expected profits not available (lack)pd_col/ead_col,Unused 0 impersonation."
+        if profit_delta is None
+        else f"Expected profits{_delta_word(profit_delta)}{abs(profit_delta):.2f}."
+    )
+    summary_text = (
+        f"New strategy approval rate compared to baseline{_delta_word(deltas['approval_rate'])}"
+        f"{abs(deltas['approval_rate']) * 100:.1f}pp,"
+        f"The downfall of the customer base.{_delta_word(deltas['approved_bad_rate'])}"
+        f"{abs(deltas['approved_bad_rate']) * 100:.2f}pp,"
+        f"{profit_text}"
+    )
+    return CompareResult(
+        matrix_2x2=matrix,
+        deltas=deltas,
+        summary_text=summary_text,
+        red_flags=tuple(red_flags),
+    )
+
+
+def _cell(target: pd.Series, mask: pd.Series) -> CompareCell:
+    count = int(mask.sum())
+    bad_rate = float((target.loc[mask] == 1).mean()) if count else None
+    return CompareCell(count=count, bad_rate=bad_rate)
+
+
+def _delta_word(value: float) -> str:
+    if value > 0:
+        return "Up"
+    if value < 0:
+        return "Down"
+    return "Hold flat."
+
+
+def _assert_columns(df: pd.DataFrame, columns: list[str]) -> None:
+    missing = [column for column in columns if column not in df.columns]
+    if missing:
+        raise StrategyError(f"missing columns: {', '.join(missing)}")
+
+
+__all__ = ["CompareCell", "CompareResult", "compare_strategies"]
