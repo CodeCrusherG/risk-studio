@@ -1,0 +1,795 @@
+{
+  "name": "analysis",
+  "version": "0.1.0",
+  "display_name": "Portfolio Analysis Pack",
+  "description": "Analyze delinquency transitions, portfolio segments, expected loss, and model stability from performance snapshots.",
+  "module": "marvis.packs.analysis.tools",
+  "python_requires": ">=3.10,<3.14",
+  "tools": [
+    {
+      "name": "flow_rate",
+      "summary": "Calculate monthly delinquency transitions and net flows into and out of adverse states.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "expected_content_hash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "id_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "snapshot_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "bucket_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "states": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          },
+          "balance_col": {
+            "type": "string"
+          },
+          "bad_states": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "dataset_id",
+          "expected_content_hash",
+          "id_col",
+          "snapshot_col",
+          "bucket_col",
+          "states"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "states": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "to_states": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "months": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "matrix_by_month": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "net_flows": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "red_flags": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        },
+        "required": [
+          "states",
+          "to_states",
+          "months",
+          "matrix_by_month",
+          "net_flows",
+          "red_flags"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_flow_rate",
+      "side_effects": [
+        "read:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "bucket_migration",
+      "summary": "Calculate average and worst-case delinquency transition matrices over the selected period.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "expected_content_hash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "id_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "snapshot_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "bucket_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "states": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          },
+          "balance_col": {
+            "type": "string"
+          },
+          "window": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "bad_states": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "dataset_id",
+          "expected_content_hash",
+          "id_col",
+          "snapshot_col",
+          "bucket_col",
+          "states"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "states": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "to_states": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "window_months": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "avg_matrix": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            }
+          },
+          "worst_matrix": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            }
+          },
+          "heat_table": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "red_flags": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        },
+        "required": [
+          "states",
+          "to_states",
+          "window_months",
+          "avg_matrix",
+          "worst_matrix",
+          "heat_table",
+          "red_flags"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_bucket_migration",
+      "side_effects": [
+        "read:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "segment_profile",
+      "summary": "Summarize segment size, approval rates, adverse outcomes, scores, profitability, and concentration.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "expected_content_hash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "segment_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "target_col": {
+            "type": "string"
+          },
+          "score_col": {
+            "type": "string"
+          },
+          "approved_col": {
+            "type": "string"
+          },
+          "profit_params": {
+            "type": "object"
+          },
+          "ead_col": {
+            "type": "string"
+          },
+          "pd_col": {
+            "type": "string"
+          },
+          "top_k": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "dataset_id",
+          "expected_content_hash",
+          "segment_col"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "segments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "concentration": {
+            "type": "object"
+          },
+          "concentration_basis": {
+            "type": "string",
+            "enum": [
+              "count"
+            ]
+          },
+          "ead_concentration": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "ead_concentration_basis": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "ead",
+              null
+            ]
+          },
+          "red_flags": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        },
+        "required": [
+          "segments",
+          "concentration",
+          "concentration_basis",
+          "ead_concentration",
+          "ead_concentration_basis",
+          "red_flags"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_segment_profile",
+      "side_effects": [
+        "read:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "expected_loss_estimate",
+      "summary": "Estimate monthly and total expected loss using an absorbing Markov chain.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "dataset_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "expected_content_hash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "id_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "snapshot_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "bucket_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "states": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          },
+          "balance_col": {
+            "type": "string",
+            "minLength": 1
+          },
+          "loss_state": {
+            "type": "string",
+            "minLength": 1
+          },
+          "lgd": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "horizon_months": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "window": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "dataset_id",
+          "expected_content_hash",
+          "id_col",
+          "snapshot_col",
+          "bucket_col",
+          "states",
+          "balance_col"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "loss_state": {
+            "type": "string"
+          },
+          "chain": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "el_by_month": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "total_el": {
+            "type": "number"
+          },
+          "assumptions": {
+            "type": "object"
+          },
+          "red_flags": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        },
+        "required": [
+          "loss_state",
+          "chain",
+          "el_by_month",
+          "total_el",
+          "assumptions",
+          "red_flags"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_expected_loss_estimate",
+      "side_effects": [
+        "read:dataset"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "score_stability_trend",
+      "summary": "Track monthly score PSI against the training baseline and flag threshold breaches.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "experiment_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "dataset_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "months": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "dataset_id": {
+            "type": "string"
+          },
+          "expected_content_hash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "month_col": {
+            "type": "string"
+          },
+          "score_col": {
+            "type": "string"
+          },
+          "thresholds": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "experiment_id"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "metric_name": {
+            "type": "string"
+          },
+          "trend": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "per_feature_trend": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "red_flags": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        },
+        "required": [
+          "metric_name",
+          "trend",
+          "per_feature_trend",
+          "red_flags"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_score_stability_trend",
+      "side_effects": [
+        "read:dataset",
+        "read:experiment"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "feature_csi_trend",
+      "summary": "Track monthly feature CSI against the training baseline and identify the largest shifts.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "experiment_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "dataset_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "months": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "dataset_id": {
+            "type": "string"
+          },
+          "month_col": {
+            "type": "string"
+          },
+          "score_col": {
+            "type": "string"
+          },
+          "feature_cols": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "thresholds": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "experiment_id"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "metric_name": {
+            "type": "string"
+          },
+          "trend": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "per_feature_trend": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "red_flags": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        },
+        "required": [
+          "metric_name",
+          "trend",
+          "per_feature_trend",
+          "red_flags"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_feature_csi_trend",
+      "side_effects": [
+        "read:dataset",
+        "read:experiment"
+      ],
+      "memory_limit_mb": 4096
+    },
+    {
+      "name": "portfolio_gate_summary",
+      "summary": "Summarize portfolio findings and flagged issues for review.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "flow": {
+            "type": "object"
+          },
+          "migration": {
+            "type": "object"
+          },
+          "segment": {
+            "type": "object"
+          },
+          "trend": {
+            "type": "object"
+          },
+          "expected_loss": {
+            "type": "object"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "highlights": {
+            "type": "object"
+          },
+          "red_flags": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "red_flag_count": {
+            "type": "integer"
+          },
+          "checklist": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "highlights",
+          "red_flags",
+          "red_flag_count",
+          "checklist"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 60,
+      "failure_policy": "fail",
+      "entrypoint": "tool_portfolio_gate_summary",
+      "policy": {
+        "schema_version": "tool-policy.v1",
+        "human_decision_gate": "required",
+        "effect_authorization": "none"
+      },
+      "side_effects": [],
+      "memory_limit_mb": 2048
+    },
+    {
+      "name": "portfolio_report",
+      "summary": "Create an Excel report from the completed portfolio analyses.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "flow": {
+            "type": "object"
+          },
+          "migration": {
+            "type": "object"
+          },
+          "segment": {
+            "type": "object"
+          },
+          "trend": {
+            "type": "object"
+          },
+          "expected_loss": {
+            "type": "object"
+          },
+          "project_meta": {
+            "type": "object"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "report_path": {
+            "type": "string"
+          },
+          "sheets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "artifact_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "artifact_content_hash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "required": [
+          "report_path",
+          "sheets",
+          "artifact_id",
+          "artifact_content_hash"
+        ],
+        "additionalProperties": false
+      },
+      "determinism": "deterministic",
+      "timeout_seconds": 120,
+      "failure_policy": "fail",
+      "entrypoint": "tool_portfolio_report",
+      "side_effects": [
+        "write:report"
+      ],
+      "memory_limit_mb": 4096
+    }
+  ],
+  "hooks": [],
+  "permissions": [
+    "read:dataset",
+    "write:dataset",
+    "read:experiment",
+    "write:report"
+  ]
+}
