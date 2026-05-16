@@ -1,0 +1,4994 @@
+from __future__ import annotations
+
+from marvis.orchestrator.contracts import PostCheck
+from marvis.orchestrator.templates import (
+    SlotSpec,
+    StepTemplate,
+    WorkflowTemplate,
+)
+from marvis.packs.strategy.candidate_design import CANDIDATE_POLICY_VERSION
+from marvis.plugins.manifest import ToolRef
+
+
+_STRATEGY_SAMPLE_DESIGN_REF_SLOT = SlotSpec(
+    "sample_design_ref",
+    True,
+    "task_context",
+    "Exact authenticated StrategySampleDesign development partition",
+)
+
+
+STRATEGY_ANALYSIS = WorkflowTemplate(
+    id="strategy_analysis",
+    title="Quick strategy analysis and backtesting",
+    goal_patterns=(
+        "Quick-track analysis",
+        "Quick-Trackback",
+        "quick strategy analysis",
+        "quick strategy backtest",
+    ),
+    slots=(
+        SlotSpec("dataset_id", True, "task_context", "Registered strategy dataset id"),
+        SlotSpec("target_col", True, "task_context", "Binary target column"),
+        _STRATEGY_SAMPLE_DESIGN_REF_SLOT,
+        SlotSpec(
+            "drop_nan_labels", False, "user", "Confirmed target null-row exclusion"
+        ),
+        SlotSpec("score_col", True, "task_context", "Score column"),
+        SlotSpec("strategy_type", True, "user", "Strategy type"),
+        SlotSpec("rules", True, "user", "Ordered strategy rules"),
+        SlotSpec("default_decision", True, "user", "Fallback decision"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Build strategy",
+            tool_ref=ToolRef("strategy", "build_strategy"),
+            inputs_template={
+                "strategy_type": "{slot:strategy_type}",
+                "rules": "{slot:rules}",
+                "score_col": "{slot:score_col}",
+                "default_decision": "{slot:default_decision}",
+                "description": "Workflow generated strategy candidate",
+            },
+            depends_on_titles=(),
+            post_checks=(PostCheck("nonempty", {"field": "strategy_id"}),),
+        ),
+        StepTemplate(
+            title="Backtest strategy",
+            tool_ref=ToolRef("strategy", "backtest_strategy"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "strategy_id": "$ref:Build strategy.output.strategy_id",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+            },
+            depends_on_titles=("Build strategy",),
+            post_checks=(
+                PostCheck("nonempty", {"field": "backtest_id"}),
+                PostCheck("range", {"field": "approval_rate", "min": 0.0, "max": 1.0}),
+                PostCheck(
+                    "range", {"field": "approved_bad_rate", "min": 0.0, "max": 1.0}
+                ),
+                PostCheck(
+                    "range", {"field": "rejected_bad_rate", "min": 0.0, "max": 1.0}
+                ),
+                PostCheck(
+                    "range", {"field": "expected_profit", "allow_null": True}
+                ),  # FIN-3 #4: None when profit requested w/o pd_col (graceful EL degradation)
+            ),
+            decision_point=True,
+        ),
+        StepTemplate(
+            title="Compare strategy trade-offs",
+            tool_ref=ToolRef("strategy", "tradeoff_view"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "score_col": "{slot:score_col}",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+            },
+            depends_on_titles=("Backtest strategy",),
+            post_checks=(PostCheck("nonempty", {"field": "points"}),),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_PROFIT_ANALYSIS = WorkflowTemplate(
+    id="strategy_profit_analysis",
+    title="Portfolio profitability analysis",
+    goal_patterns=("Group profit analysis", "Profit measurement", "profit analysis", "profit calculation"),
+    slots=(
+        SlotSpec(
+            "dataset_id", True, "task_context", "Registered task-owned dataset id"
+        ),
+        SlotSpec("ead_col", True, "user", "Exposure at default column"),
+        SlotSpec("pd_col", True, "user", "Probability of default column"),
+        SlotSpec(
+            "profit_params",
+            True,
+            "user",
+            "Pricing, funding, LGD, cost, and term assumptions",
+        ),
+        SlotSpec("segment_col", False, "user", "Optional segment column"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Calculate portfolio profitability",
+            tool_ref=ToolRef("strategy", "profit_calc"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "segment_col": "{slot:segment_col}",
+                "ead_col": "{slot:ead_col}",
+                "pd_col": "{slot:pd_col}",
+                "params": "{slot:profit_params}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "results"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            decision_point=True,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_ROLL_RATE_ANALYSIS = WorkflowTemplate(
+    id="strategy_roll_rate_analysis",
+    title="Roll-rate migration analysis",
+    goal_patterns=("roll rate Analysis", "Analysis of migration rates", "roll-rate analysis"),
+    slots=(
+        SlotSpec(
+            "dataset_id", True, "task_context", "Registered task-owned dataset id"
+        ),
+        SlotSpec("id_col", True, "user", "Entity identifier column"),
+        SlotSpec("time_col", True, "user", "Observation time column"),
+        SlotSpec("status_col", True, "user", "Status bucket column"),
+        SlotSpec("states", True, "user", "Ordered status bucket values"),
+        SlotSpec(
+            "balance_col", False, "user", "Optional from-observation balance weight"
+        ),
+        SlotSpec(
+            "observation_semantics",
+            False,
+            "user",
+            "Must be adjacent_observation; snapshot panels use bucket_migration",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Calculate migration between adjacent observations",
+            tool_ref=ToolRef("strategy", "roll_rate_matrix"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "id_col": "{slot:id_col}",
+                "time_col": "{slot:time_col}",
+                "status_col": "{slot:status_col}",
+                "states": "{slot:states}",
+                "balance_col": "{slot:balance_col}",
+                "observation_semantics": "{slot:observation_semantics}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "matrix"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            decision_point=True,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_UNIVARIATE_CANDIDATE_ANALYSIS = WorkflowTemplate(
+    id="strategy_univariate_candidate_analysis",
+    title="Univariate candidate analysis",
+    goal_patterns=(
+        "Single variable candidate analysis",
+        "Single variable effects analysis",
+        "Compare the boxing method",
+        "univariate candidate analysis",
+    ),
+    slots=(
+        SlotSpec(
+            "dataset_id", True, "task_context", "Registered task-owned dataset id"
+        ),
+        SlotSpec(
+            "expected_content_hash",
+            True,
+            "task_context",
+            "Confirmed immutable dataset hash",
+        ),
+        SlotSpec(
+            "workspace_revision",
+            False,
+            "task_context",
+            "Confirmed data-workspace revision; zero is valid",
+        ),
+        SlotSpec(
+            "analysis_generation",
+            False,
+            "task_context",
+            "Confirmed active dataset generation; zero is valid",
+        ),
+        SlotSpec(
+            "semantic_mapping_hash",
+            True,
+            "task_context",
+            "Confirmed semantic mapping hash",
+        ),
+        SlotSpec(
+            "target_col", True, "task_context", "Server-bound binary target column"
+        ),
+        SlotSpec(
+            "sample_design_ref",
+            True,
+            "task_context",
+            "Exact authenticated governed risk-development sample reference",
+        ),
+        SlotSpec(
+            "drop_nan_labels", False, "user", "Confirmed target null-row exclusion"
+        ),
+        SlotSpec(
+            "features", False, "user", "Explicit fields or [] for semantic candidates"
+        ),
+        SlotSpec(
+            "methods", False, "user", "Ordered methods or [] for type-aware defaults"
+        ),
+        SlotSpec("bin_count", True, "user", "Requested bins per numeric method"),
+        SlotSpec("min_bin_pct", True, "user", "Minimum desired bin population share"),
+        SlotSpec("loan_amount_col", False, "user", "Optional disbursed amount column"),
+        SlotSpec("overdue_amount_col", False, "user", "Optional overdue amount column"),
+        SlotSpec(
+            "sentinel_values",
+            False,
+            "user",
+            "Explicit special values kept separate; [] is valid",
+        ),
+        SlotSpec(
+            "manual_breakpoints",
+            False,
+            "user",
+            "Exact user-provided numeric cutpoints keyed by manual feature",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Analyze univariate candidates",
+            tool_ref=ToolRef("strategy", "analyze_univariate_candidates"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "expected_content_hash": "{slot:expected_content_hash}",
+                "workspace_revision": "{slot:workspace_revision}",
+                "analysis_generation": "{slot:analysis_generation}",
+                "semantic_mapping_hash": "{slot:semantic_mapping_hash}",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+                "features": "{slot:features}",
+                "methods": "{slot:methods}",
+                "bin_count": "{slot:bin_count}",
+                "min_bin_pct": "{slot:min_bin_pct}",
+                "loan_amount_col": "{slot:loan_amount_col}",
+                "overdue_amount_col": "{slot:overdue_amount_col}",
+                "sentinel_values": "{slot:sentinel_values}",
+                "manual_breakpoints": "{slot:manual_breakpoints}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "candidate_id"}),
+                PostCheck("nonempty", {"field": "evidence_hash"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+                PostCheck("range", {"field": "rankings.0.iv", "min": 0.0}),
+                PostCheck(
+                    "range",
+                    {"field": "rankings.0.ks", "min": 0.0, "max": 1.0},
+                ),
+                PostCheck(
+                    "range",
+                    {"field": "rankings.0.auc", "min": 0.0, "max": 1.0},
+                ),
+            ),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_CROSS_MATRIX_ANALYSIS = WorkflowTemplate(
+    id="strategy_cross_matrix_analysis",
+    title="Cross Matrix candidate analysis",
+    goal_patterns=(
+        "Cross-Class 2D",
+        "Two-dimensional.Cross Matrix",
+        "2D cross matrix",
+    ),
+    slots=(
+        *STRATEGY_UNIVARIATE_CANDIDATE_ANALYSIS.slots,
+        SlotSpec("x_feature", True, "user", "Explicit X-axis feature"),
+        SlotSpec("x_method", True, "user", "Explicit X-axis binning method"),
+        SlotSpec("y_feature", True, "user", "Explicit Y-axis feature"),
+        SlotSpec("y_method", True, "user", "Explicit Y-axis binning method"),
+    ),
+    steps=(
+        STRATEGY_UNIVARIATE_CANDIDATE_ANALYSIS.steps[0],
+        StepTemplate(
+            title="Build Cross Matrix candidates",
+            tool_ref=ToolRef("strategy", "build_cross_matrix_candidate"),
+            inputs_template={
+                "source_artifact_id": (
+                    "$ref:Analyze univariate candidates.output.artifacts.0.artifact_id"
+                ),
+                "expected_artifact_content_hash": (
+                    "$ref:Analyze univariate candidates.output.artifacts.0.content_hash"
+                ),
+                "expected_candidate_id": "$ref:Analyze univariate candidates.output.candidate_id",
+                "expected_evidence_hash": "$ref:Analyze univariate candidates.output.evidence_hash",
+                "x_feature": "{slot:x_feature}",
+                "x_method": "{slot:x_method}",
+                "y_feature": "{slot:y_feature}",
+                "y_method": "{slot:y_method}",
+            },
+            depends_on_titles=("Analyze univariate candidates",),
+            post_checks=(
+                PostCheck("nonempty", {"field": "asset_id"}),
+                PostCheck("nonempty", {"field": "asset_hash"}),
+                PostCheck("nonempty", {"field": "cell_count"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_CROSS_MATRIX_CANDIDATE_SEARCH = WorkflowTemplate(
+    id="strategy_cross_matrix_candidate_search",
+    title="Cross Matrix candidate search",
+    goal_patterns=(
+        "SearchCross Matrix Candidate Group",
+        "Element cross-matrix feature pair",
+        "search Cross Matrix candidate pairs",
+    ),
+    slots=(
+        SlotSpec(
+            "source_artifact_id",
+            True,
+            "task_context",
+            "Latest exact univariate candidate evidence artifact",
+        ),
+        SlotSpec(
+            "expected_artifact_content_hash",
+            True,
+            "task_context",
+            "Authenticated source artifact content hash",
+        ),
+        SlotSpec(
+            "expected_candidate_id",
+            True,
+            "task_context",
+            "Authenticated parent candidate id",
+        ),
+        SlotSpec(
+            "expected_evidence_hash",
+            True,
+            "task_context",
+            "Authenticated parent evidence hash",
+        ),
+        SlotSpec(
+            "features",
+            True,
+            "user",
+            "Two to twenty explicit candidate feature names",
+        ),
+        SlotSpec(
+            "max_pairs",
+            True,
+            "user",
+            "Hard one-to-190 deterministic pair evaluation budget",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Search Cross Matrix candidate groups",
+            tool_ref=ToolRef("strategy", "search_cross_matrix_candidates"),
+            inputs_template={
+                "source_artifact_id": "{slot:source_artifact_id}",
+                "expected_artifact_content_hash": (
+                    "{slot:expected_artifact_content_hash}"
+                ),
+                "expected_candidate_id": "{slot:expected_candidate_id}",
+                "expected_evidence_hash": "{slot:expected_evidence_hash}",
+                "features": "{slot:features}",
+                "max_pairs": "{slot:max_pairs}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "search_id"}),
+                PostCheck("nonempty", {"field": "content_hash"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_CROSS_MATRIX_CANDIDATE_BUILD_FROM_SEARCH = WorkflowTemplate(
+    id="strategy_cross_matrix_candidate_build_from_search",
+    title="Build a Cross Matrix candidate from search",
+    goal_patterns=(
+        "FromCross Search result build candidate",
+        "Physically AssignedCross Search for characterizations",
+        "build Cross candidate from search result",
+    ),
+    slots=(
+        SlotSpec(
+            "search_id",
+            True,
+            "user",
+            "Exact authenticated Cross search id",
+        ),
+        SlotSpec(
+            "pair_id",
+            True,
+            "user",
+            "Exact evaluated Cross feature-pair id",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Build the selected Cross Matrix candidate",
+            tool_ref=ToolRef(
+                "strategy",
+                "build_cross_matrix_candidate_from_search",
+            ),
+            inputs_template={
+                "search_id": "{slot:search_id}",
+                "pair_id": "{slot:pair_id}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck(
+                    "nonempty",
+                    {"field": "cross_matrix_candidate.asset_id"},
+                ),
+                PostCheck(
+                    "nonempty",
+                    {"field": "cross_matrix_candidate.asset_hash"},
+                ),
+                PostCheck(
+                    "nonempty",
+                    {"field": "source_search_selection.search_id"},
+                ),
+                PostCheck(
+                    "nonempty",
+                    {"field": "source_search_selection.pair_id"},
+                ),
+                PostCheck(
+                    "nonempty",
+                    {"field": "cross_matrix_candidate.artifacts"},
+                ),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_CROSS_RULE_SEARCH = WorkflowTemplate(
+    id="strategy_cross_rule_search",
+    title="Two- and three-variable threshold search",
+    goal_patterns=(
+        "Search 2D Cross Rule of threshold",
+        "Dig 3D Cross-high-risk rules",
+        "search bounded Cross threshold rules",
+    ),
+    slots=(
+        SlotSpec(
+            "source_artifact_id",
+            True,
+            "task_context",
+            "Latest exact univariate candidate evidence artifact",
+        ),
+        SlotSpec(
+            "expected_artifact_content_hash",
+            True,
+            "task_context",
+            "Authenticated source artifact content hash",
+        ),
+        SlotSpec(
+            "expected_candidate_id",
+            True,
+            "task_context",
+            "Authenticated parent candidate id",
+        ),
+        SlotSpec(
+            "expected_evidence_hash",
+            True,
+            "task_context",
+            "Authenticated parent evidence hash",
+        ),
+        SlotSpec("features", True, "user", "Two to twelve explicit features"),
+        SlotSpec("dimension", True, "user", "Exact dimension 2 or 3"),
+        SlotSpec(
+            "constraints",
+            True,
+            "user",
+            "Explicit lift, bad-count, hit-share and amount-lift constraints",
+        ),
+        SlotSpec(
+            "max_trials",
+            True,
+            "user",
+            "Hard one-to-5000 deterministic trial budget",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Search cross-variable threshold rules",
+            tool_ref=ToolRef("strategy", "search_cross_threshold_rules"),
+            inputs_template={
+                "source_artifact_id": "{slot:source_artifact_id}",
+                "expected_artifact_content_hash": (
+                    "{slot:expected_artifact_content_hash}"
+                ),
+                "expected_candidate_id": "{slot:expected_candidate_id}",
+                "expected_evidence_hash": "{slot:expected_evidence_hash}",
+                "features": "{slot:features}",
+                "dimension": "{slot:dimension}",
+                "constraints": "{slot:constraints}",
+                "max_trials": "{slot:max_trials}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "search_id"}),
+                PostCheck("nonempty", {"field": "content_hash"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_CROSS_RULE_CANDIDATE_BUILD_FROM_SEARCH = WorkflowTemplate(
+    id="strategy_cross_rule_candidate_build_from_search",
+    title="Build a threshold rule from search",
+    goal_patterns=(
+        "FromCross Rule search result build candidate",
+        "Physically AssignedCross Rule of threshold",
+        "build exact Cross threshold-rule candidate",
+    ),
+    slots=(
+        SlotSpec("search_id", True, "user", "Exact Cross rule search id"),
+        SlotSpec("rule_id", True, "user", "Exact evaluated Cross rule id"),
+        SlotSpec(
+            "selection_reason",
+            False,
+            "user",
+            "Optional human audit reason; never used for ranking",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Build the selected threshold rule",
+            tool_ref=ToolRef(
+                "strategy",
+                "build_cross_rule_candidate_from_search",
+            ),
+            inputs_template={
+                "search_id": "{slot:search_id}",
+                "rule_id": "{slot:rule_id}",
+                "selection_reason": "{slot:selection_reason}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "candidate.asset_id"}),
+                PostCheck("nonempty", {"field": "candidate.asset_hash"}),
+                PostCheck(
+                    "nonempty",
+                    {"field": "source_search_selection.search_id"},
+                ),
+                PostCheck(
+                    "nonempty",
+                    {"field": "source_search_selection.rule_id"},
+                ),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_CROSS_MATRIX_CELL_SELECTION = WorkflowTemplate(
+    id="strategy_cross_matrix_cell_selection",
+    title="Select Cross Matrix cells",
+    goal_patterns=(
+        "SelectionCross Matrix Precision Cells",
+        "PhysicalizationCross Matrix Specify a grid",
+        "select exact cross matrix cells",
+        "materialize cross matrix cell selection",
+    ),
+    slots=(
+        SlotSpec(
+            "source_artifact_id",
+            True,
+            "task_context",
+            "Verified task-owned Cross Matrix artifact id",
+        ),
+        SlotSpec(
+            "expected_artifact_content_hash",
+            True,
+            "task_context",
+            "Verified Cross Matrix artifact content hash",
+        ),
+        SlotSpec(
+            "expected_asset_id",
+            True,
+            "task_context",
+            "Verified Cross Matrix asset id",
+        ),
+        SlotSpec(
+            "expected_asset_hash",
+            True,
+            "task_context",
+            "Verified Cross Matrix asset hash",
+        ),
+        SlotSpec(
+            "expected_candidate_id",
+            True,
+            "task_context",
+            "Verified source candidate id",
+        ),
+        SlotSpec(
+            "expected_evidence_hash",
+            True,
+            "task_context",
+            "Verified source candidate evidence hash",
+        ),
+        SlotSpec(
+            "cell_ids",
+            True,
+            "user",
+            "Explicit Cross Matrix cell ids; normalized in source order",
+        ),
+        SlotSpec(
+            "selection_reason",
+            False,
+            "user",
+            "Optional user-owned exact-cell selection rationale",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Create a candidate from selected cells",
+            tool_ref=ToolRef("strategy", "materialize_cross_matrix_cell_selection"),
+            inputs_template={
+                "source_artifact_id": "{slot:source_artifact_id}",
+                "expected_artifact_content_hash": (
+                    "{slot:expected_artifact_content_hash}"
+                ),
+                "expected_asset_id": "{slot:expected_asset_id}",
+                "expected_asset_hash": "{slot:expected_asset_hash}",
+                "expected_candidate_id": "{slot:expected_candidate_id}",
+                "expected_evidence_hash": "{slot:expected_evidence_hash}",
+                "cell_ids": "{slot:cell_ids}",
+                "selection_reason": "{slot:selection_reason}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "selection_id"}),
+                PostCheck("nonempty", {"field": "selection_hash"}),
+                PostCheck("nonempty", {"field": "group_id"}),
+                PostCheck("nonempty", {"field": "cell_ids"}),
+                PostCheck("nonempty", {"field": "source_asset_id"}),
+                PostCheck("nonempty", {"field": "source_asset_hash"}),
+                PostCheck("nonempty", {"field": "source_candidate_id"}),
+                PostCheck("nonempty", {"field": "source_evidence_hash"}),
+                PostCheck("nonempty", {"field": "fragment_id"}),
+                PostCheck("nonempty", {"field": "rule_id"}),
+                PostCheck("nonempty", {"field": "effect_id"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_AUTOMATIC_TREE_CANDIDATE_BUILD = WorkflowTemplate(
+    id="strategy_automatic_tree_candidate_build",
+    title="Build an automatic decision tree candidate",
+    goal_patterns=(
+        "Auto-decision tree candidate",
+        "Autobuild Decision Tree",
+        "Build a full decision tree",
+        "automatic tree candidate",
+        "build automatic strategy tree",
+    ),
+    slots=(
+        SlotSpec(
+            "dataset_id", True, "task_context", "Registered task-owned dataset id"
+        ),
+        SlotSpec(
+            "expected_content_hash",
+            True,
+            "task_context",
+            "Confirmed immutable dataset hash",
+        ),
+        SlotSpec(
+            "workspace_revision",
+            False,
+            "task_context",
+            "Confirmed data-workspace revision; zero is valid",
+        ),
+        SlotSpec(
+            "analysis_generation",
+            False,
+            "task_context",
+            "Confirmed active dataset generation; zero is valid",
+        ),
+        SlotSpec(
+            "semantic_mapping_hash",
+            True,
+            "task_context",
+            "Confirmed semantic mapping hash",
+        ),
+        SlotSpec(
+            "target_col", True, "task_context", "Server-bound binary target column"
+        ),
+        SlotSpec(
+            "sample_design_ref",
+            True,
+            "task_context",
+            "Exact authenticated governed risk-development sample reference",
+        ),
+        SlotSpec("features", True, "user", "Explicit ordered tree feature fields"),
+        SlotSpec(
+            "drop_nan_labels",
+            False,
+            "user",
+            "Confirmed target null-row exclusion",
+        ),
+        SlotSpec("sample_weight_col", False, "user", "Optional sample weight column"),
+        SlotSpec(
+            "directions",
+            False,
+            "user",
+            "Optional per-feature risk directions",
+        ),
+        SlotSpec("max_depth", False, "user", "Optional maximum tree depth"),
+        SlotSpec("min_leaf_count", False, "user", "Optional minimum rows per leaf"),
+        SlotSpec(
+            "min_weight_fraction_leaf",
+            False,
+            "user",
+            "Optional minimum weighted share per leaf",
+        ),
+        SlotSpec("seed", False, "user", "Optional deterministic tree seed"),
+        SlotSpec("loan_amount_col", False, "user", "Optional disbursed amount column"),
+        SlotSpec("overdue_amount_col", False, "user", "Optional overdue amount column"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Build automatic tree candidates",
+            tool_ref=ToolRef("strategy", "build_automatic_tree_candidate"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "expected_content_hash": "{slot:expected_content_hash}",
+                "workspace_revision": "{slot:workspace_revision}",
+                "analysis_generation": "{slot:analysis_generation}",
+                "semantic_mapping_hash": "{slot:semantic_mapping_hash}",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "features": "{slot:features}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+                "sample_weight_col": "{slot:sample_weight_col}",
+                "directions": "{slot:directions}",
+                "max_depth": "{slot:max_depth}",
+                "min_leaf_count": "{slot:min_leaf_count}",
+                "min_weight_fraction_leaf": "{slot:min_weight_fraction_leaf}",
+                "seed": "{slot:seed}",
+                "loan_amount_col": "{slot:loan_amount_col}",
+                "overdue_amount_col": "{slot:overdue_amount_col}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "summary.asset_id"}),
+                PostCheck("nonempty", {"field": "summary.asset_hash"}),
+                PostCheck("nonempty", {"field": "summary.tree_id"}),
+                PostCheck("nonempty", {"field": "summary.tree_result_hash"}),
+                PostCheck("nonempty", {"field": "leaf_index"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+                PostCheck(
+                    "schema",
+                    {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"report_info_gaps": {"type": "array"}},
+                            "required": ["report_info_gaps"],
+                        }
+                    },
+                ),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_AUTOMATIC_TREE_APPLY = WorkflowTemplate(
+    id="strategy_automatic_tree_apply",
+    title="Apply an automatic decision tree",
+    goal_patterns=(
+        "Apply the full auto tree to the current sample",
+        "Write back the derivative data set of the automatic leaf node",
+        "apply complete automatic tree",
+        "write automatic tree assignments to dataset",
+    ),
+    slots=(
+        SlotSpec(
+            "source_artifact_id",
+            True,
+            "task_context",
+            "Verified task-owned automatic-tree artifact id",
+        ),
+        SlotSpec(
+            "expected_artifact_content_hash",
+            True,
+            "task_context",
+            "Verified automatic-tree artifact content hash",
+        ),
+        SlotSpec(
+            "expected_asset_id",
+            True,
+            "task_context",
+            "Verified automatic-tree asset id",
+        ),
+        SlotSpec(
+            "expected_asset_hash",
+            True,
+            "task_context",
+            "Verified automatic-tree asset hash",
+        ),
+        SlotSpec(
+            "expected_tree_result_hash",
+            True,
+            "task_context",
+            "Verified deterministic tree result hash",
+        ),
+        SlotSpec(
+            "dataset_id",
+            True,
+            "task_context",
+            "Exact source dataset bound by the tree asset",
+        ),
+        SlotSpec(
+            "expected_content_hash",
+            True,
+            "task_context",
+            "Exact source dataset content hash",
+        ),
+        SlotSpec(
+            "workspace_revision",
+            True,
+            "task_context",
+            "Exact source data-workspace revision",
+        ),
+        SlotSpec(
+            "analysis_generation",
+            True,
+            "task_context",
+            "Exact source data-workspace generation",
+        ),
+        SlotSpec(
+            "semantic_mapping_hash",
+            True,
+            "task_context",
+            "Exact source semantic mapping hash",
+        ),
+        SlotSpec(
+            "leaf_id_column",
+            False,
+            "user",
+            "Optional output column for canonical leaf ids",
+        ),
+        SlotSpec(
+            "rule_id_column",
+            False,
+            "user",
+            "Optional output column for canonical rule ids",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Write tree leaves and rules to the dataset",
+            tool_ref=ToolRef("strategy", "apply_automatic_tree"),
+            inputs_template={
+                "source_artifact_id": "{slot:source_artifact_id}",
+                "expected_artifact_content_hash": (
+                    "{slot:expected_artifact_content_hash}"
+                ),
+                "expected_asset_id": "{slot:expected_asset_id}",
+                "expected_asset_hash": "{slot:expected_asset_hash}",
+                "expected_tree_result_hash": "{slot:expected_tree_result_hash}",
+                "dataset_id": "{slot:dataset_id}",
+                "expected_content_hash": "{slot:expected_content_hash}",
+                "workspace_revision": "{slot:workspace_revision}",
+                "analysis_generation": "{slot:analysis_generation}",
+                "semantic_mapping_hash": "{slot:semantic_mapping_hash}",
+                "leaf_id_column": "{slot:leaf_id_column}",
+                "rule_id_column": "{slot:rule_id_column}",
+                # Natural-language application creates an immutable derived
+                # dataset but leaves the active DataWorkspace unchanged. This
+                # reversible boundary needs no human-responsibility gate.
+                "activate_result": False,
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "run_id"}),
+                PostCheck("nonempty", {"field": "source.asset_id"}),
+                PostCheck("nonempty", {"field": "result.dataset_id"}),
+                PostCheck("nonempty", {"field": "result.dataset_content_hash"}),
+                PostCheck("nonempty", {"field": "columns.leaf_id"}),
+                PostCheck("nonempty", {"field": "columns.rule_id"}),
+                PostCheck("nonempty", {"field": "evidence.artifact_id"}),
+                PostCheck("nonempty", {"field": "evidence.content_hash"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_PROJECT_CONTEXT = WorkflowTemplate(
+    id="strategy_project_context",
+    title="Strategy project context",
+    goal_patterns=(
+        "Collating the status of the strategic projects",
+        "Combine current project and historical strategy",
+        "Refresh the context of the policy item",
+        "materialize strategy project context",
+        "refresh strategy project context",
+    ),
+    slots=(
+        SlotSpec(
+            "expected_revision",
+            True,
+            "task_context",
+            "Current project-context CAS revision; zero means absent",
+        ),
+        SlotSpec(
+            "expected_revision_id",
+            False,
+            "task_context",
+            "Current immutable project-context revision id",
+        ),
+        SlotSpec(
+            "expected_state_hash",
+            False,
+            "task_context",
+            "Current immutable project-context state hash",
+        ),
+        SlotSpec(
+            "user_message_ref",
+            True,
+            "task_context",
+            "Exact persisted user message id and content hash",
+        ),
+        SlotSpec("as_of", True, "user", "Explicit project-status cutoff date"),
+        SlotSpec("scope", False, "user", "Optional explicit project scope or null"),
+        SlotSpec(
+            "business_context",
+            True,
+            "user",
+            "Explicit user-owned project context fields",
+        ),
+        SlotSpec(
+            "explicit_unavailable",
+            True,
+            "user",
+            "Fields the user explicitly marked unavailable",
+        ),
+        SlotSpec(
+            "external_report_filenames",
+            True,
+            "user",
+            "Task-source-relative opaque external evidence filenames",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Save project context and prior results",
+            tool_ref=ToolRef("strategy", "materialize_project_context"),
+            inputs_template={
+                "expected_revision": "{slot:expected_revision}",
+                "expected_revision_id": "{slot:expected_revision_id}",
+                "expected_state_hash": "{slot:expected_state_hash}",
+                "user_message_ref": "{slot:user_message_ref}",
+                "as_of": "{slot:as_of}",
+                "scope": "{slot:scope}",
+                "business_context": "{slot:business_context}",
+                "explicit_unavailable": "{slot:explicit_unavailable}",
+                "external_report_filenames": (
+                    "{slot:external_report_filenames}"
+                ),
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "revision"}),
+                PostCheck("nonempty", {"field": "context_artifact"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_SAMPLE_DESIGN = WorkflowTemplate(
+    id="strategy_sample_design",
+    title="Strategy sample design",
+    goal_patterns=(
+        "Solidisation policy sample design",
+        "Frozen sample border",
+        "Create policy sample design",
+        "materialize strategy sample design",
+        "freeze strategy sample boundary",
+    ),
+    slots=(
+        SlotSpec(
+            "dataset_id", True, "task_context", "Confirmed active dataset id"
+        ),
+        SlotSpec(
+            "expected_dataset_content_hash",
+            True,
+            "task_context",
+            "Confirmed immutable active dataset hash",
+        ),
+        SlotSpec(
+            "workspace_revision",
+            True,
+            "task_context",
+            "Confirmed DataWorkspace revision; zero is valid",
+        ),
+        SlotSpec(
+            "workspace_generation",
+            True,
+            "task_context",
+            "Confirmed active dataset generation; zero is valid",
+        ),
+        SlotSpec(
+            "semantic_mapping_hash",
+            True,
+            "task_context",
+            "Confirmed semantic mapping hash",
+        ),
+        SlotSpec(
+            "target_col", True, "task_context", "Confirmed binary target column"
+        ),
+        SlotSpec(
+            "performance_window_status",
+            True,
+            "user",
+            "Whether the performance window was provided",
+        ),
+        SlotSpec(
+            "performance_window_days",
+            False,
+            "user",
+            "Positive performance-window days when provided",
+        ),
+        SlotSpec(
+            "observation_window_status",
+            True,
+            "user",
+            "Whether the observation window was provided",
+        ),
+        SlotSpec(
+            "observation_start",
+            False,
+            "user",
+            "ISO observation-window start when provided",
+        ),
+        SlotSpec(
+            "observation_end",
+            False,
+            "user",
+            "ISO observation-window end when provided",
+        ),
+        SlotSpec(
+            "maturity_status",
+            True,
+            "user",
+            "Confirmed sample maturity status",
+        ),
+        SlotSpec(
+            "target_bad_value",
+            True,
+            "user",
+            "Explicit integer 0/1 value representing a bad sample",
+        ),
+        SlotSpec("split_col", False, "user", "Optional explicit split column"),
+        SlotSpec(
+            "development_values",
+            False,
+            "user",
+            "Explicit development split values",
+        ),
+        SlotSpec(
+            "validation_values",
+            False,
+            "user",
+            "Explicit validation split values",
+        ),
+        SlotSpec("oot_values", False, "user", "Explicit OOT split values"),
+        SlotSpec("month_col", False, "user", "Optional month column"),
+        SlotSpec("weight_col", False, "user", "Optional sample weight column"),
+        SlotSpec("loan_amount_col", False, "user", "Optional loan amount column"),
+        SlotSpec(
+            "overdue_amount_col", False, "user", "Optional overdue amount column"
+        ),
+        SlotSpec(
+            "drop_nan_labels",
+            True,
+            "user",
+            "Explicit or confirmed target-null exclusion policy",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Save strategy sample design",
+            tool_ref=ToolRef("strategy", "materialize_sample_design"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "expected_dataset_content_hash": (
+                    "{slot:expected_dataset_content_hash}"
+                ),
+                "workspace_revision": "{slot:workspace_revision}",
+                "workspace_generation": "{slot:workspace_generation}",
+                "semantic_mapping_hash": "{slot:semantic_mapping_hash}",
+                "target_col": "{slot:target_col}",
+                "performance_window_status": (
+                    "{slot:performance_window_status}"
+                ),
+                "performance_window_days": "{slot:performance_window_days}",
+                "observation_window_status": (
+                    "{slot:observation_window_status}"
+                ),
+                "observation_window_start": "{slot:observation_start}",
+                "observation_window_end": "{slot:observation_end}",
+                "maturity_status": "{slot:maturity_status}",
+                "target_bad_value": "{slot:target_bad_value}",
+                "split_col": "{slot:split_col}",
+                "development_values": "{slot:development_values}",
+                "validation_values": "{slot:validation_values}",
+                "oot_values": "{slot:oot_values}",
+                "month_col": "{slot:month_col}",
+                "weight_col": "{slot:weight_col}",
+                "loan_amount_col": "{slot:loan_amount_col}",
+                "overdue_amount_col": "{slot:overdue_amount_col}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "sample_design_id"}),
+                PostCheck("nonempty", {"field": "content_hash"}),
+                PostCheck("nonempty", {"field": "bundle"}),
+                PostCheck("nonempty", {"field": "artifact"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_SAMPLE_DESIGN_V2 = WorkflowTemplate(
+    id="strategy_sample_design_v2",
+    title="Approval and risk sample design",
+    goal_patterns=(
+        "SolidV2 Policy sample design",
+        "Solidified both approval and risk aggregate samples",
+        "materialize strategy sample design v2",
+    ),
+    slots=(
+        SlotSpec("dataset_id", True, "task_context", "Confirmed active dataset id"),
+        SlotSpec(
+            "expected_dataset_content_hash",
+            True,
+            "task_context",
+            "Confirmed immutable active dataset hash",
+        ),
+        SlotSpec("workspace_revision", True, "task_context", "Confirmed workspace revision"),
+        SlotSpec("workspace_generation", True, "task_context", "Confirmed workspace generation"),
+        SlotSpec("semantic_mapping_hash", True, "task_context", "Confirmed semantic mapping hash"),
+        SlotSpec("target_col", True, "task_context", "Confirmed binary target column"),
+        SlotSpec(
+            "relationship",
+            True,
+            "user",
+            "Explicit approval/risk population relationship",
+        ),
+        SlotSpec("scope", True, "task_context", "Platform-derived evidence scope"),
+        SlotSpec("policy", True, "task_context", "Platform-governed diagnostic policy"),
+        SlotSpec(
+            "compatibility_performance_window_status",
+            True,
+            "task_context",
+            "Validated V1-anchor projection of performance_window.status",
+        ),
+        SlotSpec(
+            "compatibility_performance_window_days",
+            False,
+            "task_context",
+            "Validated V1-anchor projection of performance_window.days",
+        ),
+        SlotSpec(
+            "compatibility_observation_window_status",
+            True,
+            "task_context",
+            "Validated V1-anchor projection of observation_window.status",
+        ),
+        SlotSpec("compatibility_observation_start", False, "task_context", "Validated V1 observation start"),
+        SlotSpec("compatibility_observation_end", False, "task_context", "Validated V1 observation end"),
+        SlotSpec("compatibility_maturity_status", True, "task_context", "Validated V1 maturity projection"),
+        SlotSpec("compatibility_split_col", True, "task_context", "Lossless simple split column"),
+        SlotSpec("compatibility_development_values", True, "task_context", "Lossless development value"),
+        SlotSpec("compatibility_validation_values", True, "task_context", "Lossless validation value"),
+        SlotSpec("compatibility_oot_values", True, "task_context", "Lossless OOT value"),
+        SlotSpec("compatibility_month_col", False, "task_context", "V1-compatible month field"),
+        SlotSpec("compatibility_weight_col", False, "task_context", "V1-compatible weight field"),
+        SlotSpec("compatibility_loan_amount_col", False, "task_context", "V1-compatible loan amount field"),
+        SlotSpec("compatibility_overdue_amount_col", False, "task_context", "V1-compatible overdue amount field"),
+        SlotSpec("target_bad_value", True, "user", "Explicit integer bad-label value"),
+        SlotSpec("drop_nan_labels", True, "user", "Explicit target-null policy"),
+        SlotSpec("approval_population", True, "user", "Explicit approval population predicates"),
+        SlotSpec("risk_population", True, "user", "Explicit risk population predicates"),
+        SlotSpec("partitioning", True, "user", "Explicit three-way partition definition"),
+        SlotSpec("maturity", True, "user", "Explicit maturity evidence controls"),
+        SlotSpec("performance_window", True, "user", "Explicit performance window"),
+        SlotSpec("observation_window", True, "user", "Explicit observation window"),
+        SlotSpec("field_bindings", True, "user", "Explicit optional field roles"),
+        SlotSpec("historical_score", True, "user", "Explicit historical score status"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Save the sample reference",
+            tool_ref=ToolRef("strategy", "materialize_sample_design"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "expected_dataset_content_hash": "{slot:expected_dataset_content_hash}",
+                "workspace_revision": "{slot:workspace_revision}",
+                "workspace_generation": "{slot:workspace_generation}",
+                "semantic_mapping_hash": "{slot:semantic_mapping_hash}",
+                "target_col": "{slot:target_col}",
+                "target_bad_value": "{slot:target_bad_value}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+                "performance_window_status": "{slot:compatibility_performance_window_status}",
+                "performance_window_days": "{slot:compatibility_performance_window_days}",
+                "observation_window_status": "{slot:compatibility_observation_window_status}",
+                "observation_window_start": "{slot:compatibility_observation_start}",
+                "observation_window_end": "{slot:compatibility_observation_end}",
+                "maturity_status": "{slot:compatibility_maturity_status}",
+                "split_col": "{slot:compatibility_split_col}",
+                "development_values": "{slot:compatibility_development_values}",
+                "validation_values": "{slot:compatibility_validation_values}",
+                "oot_values": "{slot:compatibility_oot_values}",
+                "month_col": "{slot:compatibility_month_col}",
+                "weight_col": "{slot:compatibility_weight_col}",
+                "loan_amount_col": "{slot:compatibility_loan_amount_col}",
+                "overdue_amount_col": "{slot:compatibility_overdue_amount_col}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "sample_design_id"}),
+                PostCheck("nonempty", {"field": "content_hash"}),
+                PostCheck("nonempty", {"field": "artifact.artifact_id"}),
+                PostCheck("nonempty", {"field": "artifact.content_hash"}),
+            ),
+            needs_confirmation=False,
+        ),
+        StepTemplate(
+            title="Save approval and risk sample definitions",
+            tool_ref=ToolRef("strategy", "materialize_sample_design_v2"),
+            inputs_template={
+                "legacy_sample_design_ref": {
+                    "artifact_id": "$ref:Save the sample reference.output.artifact.artifact_id",
+                    "artifact_content_hash": "$ref:Save the sample reference.output.artifact.content_hash",
+                    "sample_design_id": "$ref:Save the sample reference.output.sample_design_id",
+                    "sample_design_content_hash": "$ref:Save the sample reference.output.content_hash",
+                    "partition": "development",
+                },
+                "relationship": "{slot:relationship}",
+                "scope": "{slot:scope}",
+                "approval_population": "{slot:approval_population}",
+                "risk_population": "{slot:risk_population}",
+                "partitioning": "{slot:partitioning}",
+                "maturity": "{slot:maturity}",
+                "performance_window": "{slot:performance_window}",
+                "observation_window": "{slot:observation_window}",
+                "field_bindings": "{slot:field_bindings}",
+                "historical_score": "{slot:historical_score}",
+                "policy": "{slot:policy}",
+            },
+            depends_on_titles=("Save the sample reference",),
+            post_checks=(
+                PostCheck("nonempty", {"field": "bundle_id"}),
+                PostCheck("nonempty", {"field": "sample_design_id"}),
+                PostCheck("nonempty", {"field": "sample_design_content_hash"}),
+                PostCheck("nonempty", {"field": "membership_id"}),
+                PostCheck("nonempty", {"field": "membership_content_hash"}),
+                PostCheck("nonempty", {"field": "artifacts.membership.kind"}),
+                PostCheck("nonempty", {"field": "artifacts.membership.filename"}),
+                PostCheck("nonempty", {"field": "artifacts.bundle.kind"}),
+                PostCheck("nonempty", {"field": "artifacts.bundle.filename"}),
+                PostCheck("nonempty", {"field": "artifacts.bundle.content_hash"}),
+                PostCheck("nonempty", {"field": "legacy_mapping.legacy_development_ref"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_SAMPLE_DESIGN_V2_NATIVE = WorkflowTemplate(
+    id="strategy_sample_design_v2_native",
+    title="Design samples from the active dataset",
+    goal_patterns=(
+        "ProtochemicalV2 Policy sample design",
+        "Bioconsolidation approval and risk-based overall sample",
+        "materialize native strategy sample design v2",
+    ),
+    slots=(
+        SlotSpec("dataset_id", True, "task_context", "Confirmed active dataset id"),
+        SlotSpec(
+            "expected_dataset_content_hash",
+            True,
+            "task_context",
+            "Confirmed immutable active dataset hash",
+        ),
+        SlotSpec(
+            "workspace_revision",
+            True,
+            "task_context",
+            "Confirmed workspace revision",
+        ),
+        SlotSpec(
+            "workspace_generation",
+            True,
+            "task_context",
+            "Confirmed workspace generation",
+        ),
+        SlotSpec(
+            "semantic_mapping_hash",
+            True,
+            "task_context",
+            "Confirmed semantic mapping hash",
+        ),
+        SlotSpec(
+            "target_col",
+            True,
+            "task_context",
+            "Confirmed binary target column",
+        ),
+        SlotSpec("scope", True, "task_context", "Platform-derived evidence scope"),
+        SlotSpec(
+            "policy",
+            True,
+            "task_context",
+            "Platform-governed diagnostic policy",
+        ),
+        SlotSpec(
+            "target_bad_value",
+            True,
+            "user",
+            "Explicit integer bad-label value",
+        ),
+        SlotSpec(
+            "drop_nan_labels",
+            True,
+            "user",
+            "Explicit target-null policy",
+        ),
+        SlotSpec(
+            "relationship",
+            True,
+            "user",
+            "Explicit approval/risk population relationship",
+        ),
+        SlotSpec(
+            "approval_population",
+            True,
+            "user",
+            "Explicit approval population predicates",
+        ),
+        SlotSpec(
+            "risk_population",
+            True,
+            "user",
+            "Explicit risk population predicates",
+        ),
+        SlotSpec(
+            "partitioning",
+            True,
+            "user",
+            "Explicit three-way partition definition",
+        ),
+        SlotSpec(
+            "maturity",
+            True,
+            "user",
+            "Explicit maturity evidence controls",
+        ),
+        SlotSpec(
+            "performance_window",
+            True,
+            "user",
+            "Explicit performance window",
+        ),
+        SlotSpec(
+            "observation_window",
+            True,
+            "user",
+            "Explicit observation window",
+        ),
+        SlotSpec(
+            "field_bindings",
+            True,
+            "user",
+            "Explicit optional field roles",
+        ),
+        SlotSpec(
+            "historical_score",
+            True,
+            "user",
+            "Explicit historical score status",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Create approval and risk samples from the active dataset",
+            tool_ref=ToolRef(
+                "strategy",
+                "materialize_sample_design_v2_native",
+            ),
+            inputs_template={
+                "source_mode": "native_active_dataset",
+                "dataset_id": "{slot:dataset_id}",
+                "expected_dataset_content_hash": (
+                    "{slot:expected_dataset_content_hash}"
+                ),
+                "workspace_revision": "{slot:workspace_revision}",
+                "workspace_generation": "{slot:workspace_generation}",
+                "semantic_mapping_hash": "{slot:semantic_mapping_hash}",
+                "target_col": "{slot:target_col}",
+                "target_bad_value": "{slot:target_bad_value}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+                "relationship": "{slot:relationship}",
+                "scope": "{slot:scope}",
+                "approval_population": "{slot:approval_population}",
+                "risk_population": "{slot:risk_population}",
+                "partitioning": "{slot:partitioning}",
+                "maturity": "{slot:maturity}",
+                "performance_window": "{slot:performance_window}",
+                "observation_window": "{slot:observation_window}",
+                "field_bindings": "{slot:field_bindings}",
+                "historical_score": "{slot:historical_score}",
+                "policy": "{slot:policy}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "bundle_id"}),
+                PostCheck("nonempty", {"field": "sample_design_id"}),
+                PostCheck("nonempty", {"field": "sample_design_content_hash"}),
+                PostCheck("nonempty", {"field": "membership_id"}),
+                PostCheck("nonempty", {"field": "membership_content_hash"}),
+                PostCheck("nonempty", {"field": "artifacts.membership.kind"}),
+                PostCheck("nonempty", {"field": "artifacts.membership.filename"}),
+                PostCheck("nonempty", {"field": "artifacts.bundle.kind"}),
+                PostCheck("nonempty", {"field": "artifacts.bundle.filename"}),
+                PostCheck("nonempty", {"field": "artifacts.bundle.content_hash"}),
+                PostCheck("nonempty", {"field": "source_binding.source_mode"}),
+                PostCheck(
+                    "nonempty",
+                    {"field": "source_binding.development_partition"},
+                ),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_MODEL_EVIDENCE_V2 = WorkflowTemplate(
+    id="strategy_model_evidence_v2",
+    title="Assemble strategy model results",
+    goal_patterns=(
+        "Summarize the evidence of candidates for the existing authentication list variable",
+        "GenerateStrategy ModelEvidence V2",
+        "materialize strategy model evidence v2",
+    ),
+    slots=(
+        SlotSpec(
+            "sample_design_ref",
+            True,
+            "task_context",
+            "Exact verified StrategySampleDesign V2 artifact tuple",
+        ),
+        SlotSpec(
+            "univariate_sources",
+            True,
+            "task_context",
+            "Platform-discovered authenticated univariate candidate sources",
+        ),
+        SlotSpec(
+            "expected_registry_token",
+            True,
+            "task_context",
+            "CAS token for the complete Agent-discovered evidence registry",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Assemble verified univariate results",
+            tool_ref=ToolRef("strategy", "materialize_model_evidence_v2"),
+            inputs_template={
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "univariate_sources": "{slot:univariate_sources}",
+                "expected_registry_token": "{slot:expected_registry_token}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "bundle_id"}),
+                PostCheck("nonempty", {"field": "bundle_content_hash"}),
+                PostCheck("nonempty", {"field": "sample_design_id"}),
+                PostCheck("nonempty", {"field": "source_artifacts"}),
+                PostCheck("nonempty", {"field": "artifact.content_hash"}),
+                PostCheck("nonempty", {"field": "univariate_only"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_MODEL_SCORE_COMPARISON_V2 = WorkflowTemplate(
+    id="strategy_model_score_comparison_v2",
+    title="Compare model scores on the same sample",
+    goal_patterns=(
+        "Compare the model score evidence on the same sample.",
+        "Generate non-selected model rating comparative evidence",
+        "compare governed model score evidence without selection",
+        "materialize model score comparison v2",
+    ),
+    slots=(
+        SlotSpec(
+            "sample_design_ref",
+            True,
+            "task_context",
+            "Exact authenticated StrategySampleDesign V2 artifact pair",
+        ),
+        SlotSpec(
+            "model_score_evidence_refs",
+            True,
+            "task_context",
+            "At least two platform-discovered same-task score-evidence pairs",
+        ),
+        SlotSpec(
+            "population",
+            True,
+            "user",
+            "Explicit governed population to compare: approval or risk",
+        ),
+        SlotSpec(
+            "partition",
+            True,
+            "user",
+            "Explicit governed partition: overall, development, validation, or oot",
+        ),
+        SlotSpec(
+            "expected_registry_token",
+            True,
+            "task_context",
+            "CAS token for the complete platform-discovered score registry",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Compare model scores without selecting a model",
+            tool_ref=ToolRef(
+                "strategy",
+                "materialize_model_score_comparison_v2",
+            ),
+            inputs_template={
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "model_score_evidence_refs": (
+                    "{slot:model_score_evidence_refs}"
+                ),
+                "population": "{slot:population}",
+                "partition": "{slot:partition}",
+                "expected_registry_token": "{slot:expected_registry_token}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "comparison_id"}),
+                PostCheck("nonempty", {"field": "comparison_content_hash"}),
+                PostCheck("nonempty", {"field": "comparison.metrics"}),
+                PostCheck("nonempty", {"field": "comparison.selection.status"}),
+                PostCheck("nonempty", {"field": "artifact.artifact_id"}),
+                PostCheck("nonempty", {"field": "artifact.content_hash"}),
+                PostCheck("nonempty", {"field": "governance.selection_status"}),
+            ),
+            needs_confirmation=False,
+            decision_point=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_VOTING_CANDIDATE_BUILD = WorkflowTemplate(
+    id="strategy_voting_candidate_build",
+    title="Build a Voting n-of-k candidate",
+    goal_patterns=(
+        "BuildVoting Strategic candidate",
+        "Build a cast candidate",
+        "Generaten-of-k Strategic candidate",
+        "build voting strategy candidate",
+        "build n-of-k candidate",
+    ),
+    slots=(
+        SlotSpec("strategy_type", True, "user", "Explicit Strategy Pool type"),
+        SlotSpec(
+            "expected_pool_revision",
+            True,
+            "task_context",
+            "Current Strategy Pool CAS revision",
+        ),
+        SlotSpec(
+            "expected_pool_snapshot_hash",
+            True,
+            "task_context",
+            "Current Strategy Pool CAS snapshot hash",
+        ),
+        SlotSpec(
+            "selected_entry_ids",
+            True,
+            "task_context",
+            "Platform-resolved duplicate-free current Pool entry ids",
+        ),
+        SlotSpec("n", True, "user", "Required hits in the n-of-k condition"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Build Voting n-of-k candidate",
+            tool_ref=ToolRef("strategy", "build_voting_candidate"),
+            inputs_template={
+                "strategy_type": "{slot:strategy_type}",
+                "expected_pool_revision": "{slot:expected_pool_revision}",
+                "expected_pool_snapshot_hash": (
+                    "{slot:expected_pool_snapshot_hash}"
+                ),
+                "selected_entry_ids": "{slot:selected_entry_ids}",
+                "n": "{slot:n}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "asset_id"}),
+                PostCheck("nonempty", {"field": "asset_hash"}),
+                PostCheck("nonempty", {"field": "candidate_id"}),
+                PostCheck("nonempty", {"field": "evidence_hash"}),
+                PostCheck("nonempty", {"field": "fragment_id"}),
+                PostCheck("nonempty", {"field": "effect_id"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_VOTING_CANDIDATE_BUILD_FROM_SEARCH = WorkflowTemplate(
+    id="strategy_voting_candidate_build_from_search",
+    title="Build a Voting candidate from search",
+    goal_patterns=(
+        "FromVoting Search result build candidate",
+        "Physically AssignedVoting Search Group",
+        "build voting candidate from search result",
+        "materialize exact voting search combination",
+    ),
+    slots=(
+        SlotSpec("search_id", True, "user", "Exact authenticated Voting search id"),
+        SlotSpec("combo_id", True, "user", "Exact evaluated Voting combination id"),
+        SlotSpec(
+            "strategy_type",
+            False,
+            "user",
+            "Optional explicit Strategy Pool type",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Build the selected Voting candidate",
+            tool_ref=ToolRef("strategy", "build_voting_candidate_from_search"),
+            inputs_template={
+                "search_id": "{slot:search_id}",
+                "combo_id": "{slot:combo_id}",
+                "strategy_type": "{slot:strategy_type}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "voting_candidate.asset_id"}),
+                PostCheck("nonempty", {"field": "voting_candidate.asset_hash"}),
+                PostCheck("nonempty", {"field": "voting_candidate.candidate_id"}),
+                PostCheck("nonempty", {"field": "voting_candidate.evidence_hash"}),
+                PostCheck("nonempty", {"field": "voting_candidate.fragment_id"}),
+                PostCheck("nonempty", {"field": "voting_candidate.effect_id"}),
+                PostCheck(
+                    "nonempty",
+                    {"field": "source_search_selection.search_id"},
+                ),
+                PostCheck(
+                    "nonempty",
+                    {"field": "source_search_selection.combo_id"},
+                ),
+                PostCheck("nonempty", {"field": "voting_candidate.artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_VOTING_CANDIDATE_SEARCH = WorkflowTemplate(
+    id="strategy_voting_candidate_search",
+    title="Search Voting n-of-k groups",
+    goal_patterns=(
+        "SearchVoting Policy Group",
+        "Find cast",
+        "Optimizationn-of-k Group",
+        "search voting combinations",
+        "optimize n-of-k combinations",
+    ),
+    slots=(
+        SlotSpec("strategy_type", True, "user", "Explicit Strategy Pool type"),
+        SlotSpec(
+            "pool_ref",
+            True,
+            "task_context",
+            "Exact authenticated current Strategy Pool identity",
+        ),
+        SlotSpec(
+            "member_count",
+            True,
+            "user",
+            "Number of member rules in each searched combination",
+        ),
+        SlotSpec("n", True, "user", "Required member hits"),
+        SlotSpec(
+            "objective",
+            True,
+            "user",
+            "Explicit deterministic metric and ordering direction",
+        ),
+        SlotSpec(
+            "constraints",
+            True,
+            "user",
+            "Explicit deterministic eligibility constraints; [] is valid",
+        ),
+        SlotSpec(
+            "include_rule_ids",
+            True,
+            "user",
+            "Explicit mandatory current Pool rule ids; [] is valid",
+        ),
+        SlotSpec(
+            "exclude_rule_ids",
+            True,
+            "user",
+            "Explicit excluded current Pool rule ids; [] is valid",
+        ),
+        SlotSpec(
+            "max_combinations",
+            True,
+            "user",
+            "Hard deterministic combination evaluation budget",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Search Voting n-of-k groups",
+            tool_ref=ToolRef("strategy", "search_voting_candidates"),
+            inputs_template={
+                "strategy_type": "{slot:strategy_type}",
+                "pool_ref": "{slot:pool_ref}",
+                "member_count": "{slot:member_count}",
+                "n": "{slot:n}",
+                "objective": "{slot:objective}",
+                "constraints": "{slot:constraints}",
+                "include_rule_ids": "{slot:include_rule_ids}",
+                "exclude_rule_ids": "{slot:exclude_rule_ids}",
+                "max_combinations": "{slot:max_combinations}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "search_id"}),
+                PostCheck("nonempty", {"field": "content_hash"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_AUTOMATIC_TREE_LEAF_MATERIALIZATION = WorkflowTemplate(
+    id="strategy_automatic_tree_leaf_materialization",
+    title="Select an automatic tree node",
+    goal_patterns=(
+        "Physical Auto-Treaties Specified Leave Nodes",
+        "Select Automatic Tree Precision Node",
+        "materialize exact automatic tree leaf",
+        "materialize an automatic tree leaf",
+    ),
+    slots=(
+        SlotSpec(
+            "source_artifact_id",
+            True,
+            "task_context",
+            "Verified task-owned automatic-tree artifact id",
+        ),
+        SlotSpec(
+            "expected_artifact_content_hash",
+            True,
+            "task_context",
+            "Verified automatic-tree artifact content hash",
+        ),
+        SlotSpec(
+            "expected_asset_id",
+            True,
+            "task_context",
+            "Verified automatic-tree asset id",
+        ),
+        SlotSpec(
+            "expected_asset_hash",
+            True,
+            "task_context",
+            "Verified automatic-tree asset hash",
+        ),
+        SlotSpec(
+            "expected_tree_result_hash",
+            True,
+            "task_context",
+            "Verified deterministic tree result hash",
+        ),
+        SlotSpec("leaf_id", True, "user", "Explicit automatic-tree leaf id"),
+        SlotSpec(
+            "selection_reason",
+            False,
+            "user",
+            "Optional user-owned leaf selection rationale",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Create a candidate from the selected tree node",
+            tool_ref=ToolRef("strategy", "materialize_automatic_tree_leaf_fragment"),
+            inputs_template={
+                "source_artifact_id": "{slot:source_artifact_id}",
+                "expected_artifact_content_hash": (
+                    "{slot:expected_artifact_content_hash}"
+                ),
+                "expected_asset_id": "{slot:expected_asset_id}",
+                "expected_asset_hash": "{slot:expected_asset_hash}",
+                "expected_tree_result_hash": "{slot:expected_tree_result_hash}",
+                "leaf_id": "{slot:leaf_id}",
+                "selection_reason": "{slot:selection_reason}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "selection_id"}),
+                PostCheck("nonempty", {"field": "selection_hash"}),
+                PostCheck("nonempty", {"field": "tree_asset_id"}),
+                PostCheck("nonempty", {"field": "tree_asset_hash"}),
+                PostCheck("nonempty", {"field": "tree_result_hash"}),
+                PostCheck("nonempty", {"field": "leaf_id"}),
+                PostCheck("nonempty", {"field": "fragment_id"}),
+                PostCheck("nonempty", {"field": "fragment_hash"}),
+                PostCheck("nonempty", {"field": "rule_id"}),
+                PostCheck("nonempty", {"field": "effect_id"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_INTERACTIVE_TREE_SPLIT_SEARCH = WorkflowTemplate(
+    id="strategy_interactive_tree_split_search",
+    title="Search interactive tree splits",
+    goal_patterns=(
+        "Search for all features of interactive decision tree nodes",
+        "Analyse the split candidate for decision tree nodes",
+        "Do single-sign candidate threshold search for specified nodes",
+        "search all split candidates for an interactive tree node",
+        "rank split thresholds for a tree node",
+    ),
+    slots=(
+        SlotSpec(
+            "source_tree_id",
+            True,
+            "user",
+            "Exact automatic-tree asset id or interactive-tree revision id",
+        ),
+        SlotSpec("node_id", True, "user", "Exact currently visible node id"),
+        SlotSpec(
+            "mode",
+            True,
+            "user",
+            "Exact all_features or selected_features search scope",
+        ),
+        SlotSpec(
+            "features",
+            False,
+            "user",
+            "Explicit feature subset for selected_features mode",
+        ),
+        SlotSpec(
+            "max_thresholds_per_feature",
+            True,
+            "user",
+            "Explicit 1..20 threshold-candidate budget per feature",
+        ),
+        SlotSpec(
+            "max_row_evaluations",
+            True,
+            "user",
+            "Explicit 1..20000000 aggregate row-evaluation budget",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Search node splits",
+            tool_ref=ToolRef(
+                "strategy",
+                "search_interactive_tree_split_candidates",
+            ),
+            inputs_template={
+                "source_tree_id": "{slot:source_tree_id}",
+                "node_id": "{slot:node_id}",
+                "mode": "{slot:mode}",
+                "features": "{slot:features}",
+                "max_thresholds_per_feature": (
+                    "{slot:max_thresholds_per_feature}"
+                ),
+                "max_row_evaluations": "{slot:max_row_evaluations}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "search_id"}),
+                PostCheck("nonempty", {"field": "search_hash"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_INTERACTIVE_TREE_AUTO_CONTINUATION = WorkflowTemplate(
+    id="strategy_interactive_tree_auto_continuation",
+    title="Continue growing an interactive tree",
+    goal_patterns=(
+        "Autoresume the tree from the clearly selected node",
+        "Continue to grow interactive decision tree within hard budgets",
+        "auto continue an interactive tree from an exact candidate",
+    ),
+    slots=(
+        SlotSpec("search_id", True, "user", "Exact authenticated split search id"),
+        SlotSpec(
+            "candidate_id",
+            True,
+            "user",
+            "Exact eligible seed candidate selected by the user",
+        ),
+        SlotSpec(
+            "max_additional_depth",
+            True,
+            "user",
+            "Explicit 1..6 additional-depth limit",
+        ),
+        SlotSpec(
+            "min_gini_gain",
+            True,
+            "user",
+            "Explicit finite 0..0.5 minimum Gini gain",
+        ),
+        SlotSpec(
+            "max_generated_nodes",
+            True,
+            "user",
+            "Explicit 3..127 generated-node limit",
+        ),
+        SlotSpec(
+            "max_thresholds_per_feature",
+            True,
+            "user",
+            "Explicit 1..20 threshold-candidate limit per feature",
+        ),
+        SlotSpec(
+            "max_row_evaluations",
+            True,
+            "user",
+            "Explicit 1..20000000 aggregate row-evaluation limit",
+        ),
+        SlotSpec("objective", True, "user", "Fixed max_gini_gain objective"),
+        SlotSpec(
+            "tie_break",
+            True,
+            "user",
+            "Fixed deterministic eligible/gain/feature/threshold/id tie-break",
+        ),
+        SlotSpec(
+            "reason",
+            False,
+            "user",
+            "Optional user-owned audit rationale",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Grow the selected tree within the chosen limits",
+            tool_ref=ToolRef("strategy", "auto_continue_interactive_tree"),
+            inputs_template={
+                "search_id": "{slot:search_id}",
+                "candidate_id": "{slot:candidate_id}",
+                "max_additional_depth": "{slot:max_additional_depth}",
+                "min_gini_gain": "{slot:min_gini_gain}",
+                "max_generated_nodes": "{slot:max_generated_nodes}",
+                "max_thresholds_per_feature": (
+                    "{slot:max_thresholds_per_feature}"
+                ),
+                "max_row_evaluations": "{slot:max_row_evaluations}",
+                "objective": "{slot:objective}",
+                "tie_break": "{slot:tie_break}",
+                "reason": "{slot:reason}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "revision_id"}),
+                PostCheck("nonempty", {"field": "revision_hash"}),
+                PostCheck("nonempty", {"field": "search_id"}),
+                PostCheck("nonempty", {"field": "candidate_id"}),
+                PostCheck(
+                    "one_of",
+                    {"field": "replay.exactly_once", "values": [True]},
+                ),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_INTERACTIVE_TREE_REVISION = WorkflowTemplate(
+    id="strategy_interactive_tree_revision",
+    title="Revise an interactive decision tree",
+    goal_patterns=(
+        "Cut interactive decision tree nodes",
+        "Delete Decision Tree",
+        "Create a cutout version based on an automatic tree",
+        "Adjusting the threshold for the split of interactive decision tree",
+        "Replace the split character of the interactive decision tree",
+        "prune an interactive decision tree subtree",
+        "adjust an interactive decision tree split threshold",
+        "replace an interactive decision tree split feature",
+        "create an immutable interactive tree revision",
+    ),
+    slots=(
+        SlotSpec(
+            "source_tree_id",
+            True,
+            "user",
+            "Exact automatic-tree asset id or interactive-tree revision id",
+        ),
+        SlotSpec(
+            "node_id",
+            True,
+            "user",
+            "Exact currently visible split-node id",
+        ),
+        SlotSpec(
+            "operation",
+            True,
+            "user",
+            "Exact prune_subtree or adjust_split_threshold operation",
+        ),
+        SlotSpec(
+            "feature",
+            False,
+            "user",
+            "Exact authenticated feature for a split-feature replacement",
+        ),
+        SlotSpec(
+            "threshold",
+            False,
+            "user",
+            "Exact finite user-owned threshold for a threshold adjustment",
+        ),
+        SlotSpec(
+            "reason",
+            False,
+            "user",
+            "Optional user-owned audit rationale for this tree edit",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Save a pruned tree revision",
+            tool_ref=ToolRef("strategy", "revise_interactive_tree"),
+            inputs_template={
+                "source_tree_id": "{slot:source_tree_id}",
+                "node_id": "{slot:node_id}",
+                "operation": "{slot:operation}",
+                "feature": "{slot:feature}",
+                "threshold": "{slot:threshold}",
+                "reason": "{slot:reason}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "revision_id"}),
+                PostCheck("nonempty", {"field": "revision_hash"}),
+                PostCheck("nonempty", {"field": "semantic_tree_id"}),
+                PostCheck("nonempty", {"field": "tree_hash"}),
+                PostCheck(
+                    "one_of",
+                    {"field": "replay.exactly_once", "values": [True]},
+                ),
+                PostCheck("nonempty", {"field": "replay.result_hash"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_INTERACTIVE_TREE_FRONTIER_GROUP_MATERIALIZATION = WorkflowTemplate(
+    id="strategy_interactive_tree_frontier_group_materialization",
+    title="Combine interactive tree frontier nodes",
+    goal_patterns=(
+        "Frontline of interactive decision-making treeOR Group",
+        "Combining the interactive tree frontier nodes",
+        "Prepare multiple interactive tree nodes for oneOR Candidates",
+        "materialize an interactive tree frontier OR group",
+        "select exact interactive tree frontier nodes as one OR group",
+    ),
+    slots=(
+        SlotSpec(
+            "revision_id",
+            True,
+            "user",
+            "Exact immutable interactive-tree revision id",
+        ),
+        SlotSpec(
+            "source_node_ids",
+            True,
+            "user",
+            "Two to fifty exact source node ids from the revision frontier",
+        ),
+        SlotSpec(
+            "selection_reason",
+            False,
+            "user",
+            "Optional user-owned frontier OR-group selection rationale",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Create a candidate from frontier node groups",
+            tool_ref=ToolRef(
+                "strategy",
+                "materialize_interactive_tree_frontier_group_selection",
+            ),
+            inputs_template={
+                "revision_id": "{slot:revision_id}",
+                "source_node_ids": "{slot:source_node_ids}",
+                "selection_reason": "{slot:selection_reason}",
+            },
+            depends_on_titles=(),
+            post_checks=tuple(
+                PostCheck("nonempty", {"field": field})
+                for field in (
+                    "selection_id",
+                    "selection_hash",
+                    "group_id",
+                    "revision_id",
+                    "semantic_tree_id",
+                    "tree_hash",
+                    "source_node_ids",
+                    "member_count",
+                    "fragment_id",
+                    "rule_id",
+                    "effect_id",
+                    "artifacts",
+                )
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_INTERACTIVE_TREE_FRONTIER_MATERIALIZATION = WorkflowTemplate(
+    id="strategy_interactive_tree_frontier_materialization",
+    title="Select an interactive tree frontier node",
+    goal_patterns=(
+        "Interactive decision tree nodes",
+        "Select interactive tree frontier node",
+        "Prepare interactive tree nodes for pool candidates",
+        "materialize an interactive tree frontier selection",
+        "select one exact interactive tree frontier node",
+    ),
+    slots=(
+        SlotSpec(
+            "revision_id",
+            True,
+            "user",
+            "Exact immutable interactive-tree revision id",
+        ),
+        SlotSpec(
+            "source_node_id",
+            True,
+            "user",
+            "Exact source node id from the revision frontier",
+        ),
+        SlotSpec(
+            "selection_reason",
+            False,
+            "user",
+            "Optional user-owned frontier selection rationale",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Create a candidate from a frontier node",
+            tool_ref=ToolRef(
+                "strategy",
+                "materialize_interactive_tree_frontier_selection",
+            ),
+            inputs_template={
+                "revision_id": "{slot:revision_id}",
+                "source_node_id": "{slot:source_node_id}",
+                "selection_reason": "{slot:selection_reason}",
+            },
+            depends_on_titles=(),
+            post_checks=tuple(
+                PostCheck("nonempty", {"field": field})
+                for field in (
+                    "selection_id",
+                    "selection_hash",
+                    "revision_id",
+                    "semantic_tree_id",
+                    "tree_hash",
+                    "source_node_id",
+                    "leaf_id",
+                    "fragment_id",
+                    "fragment_hash",
+                    "rule_id",
+                    "effect_id",
+                    "artifacts",
+                )
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_UNIVARIATE_CANDIDATE_REFINEMENT = WorkflowTemplate(
+    id="strategy_univariate_candidate_refinement",
+    title="Select and merge univariate candidates",
+    goal_patterns=(
+        "Single Variable Candidate Selection",
+        "Merge Subboxes",
+        "Filter Policy Rules",
+        "univariate candidate refinement",
+    ),
+    slots=(
+        *STRATEGY_UNIVARIATE_CANDIDATE_ANALYSIS.slots,
+        SlotSpec("feature", True, "user", "Feature to refine from candidate evidence"),
+        SlotSpec("method", True, "user", "Binning method to refine"),
+        SlotSpec(
+            "merge_groups",
+            False,
+            "user",
+            "Explicit groups of source bin ids; [] keeps source bins unchanged",
+        ),
+        SlotSpec(
+            "selection",
+            True,
+            "user",
+            "Explicit source bin ids or an observed-risk threshold",
+        ),
+        SlotSpec(
+            "selection_reason",
+            False,
+            "user",
+            "Optional user-owned rationale, never a calculated result",
+        ),
+    ),
+    steps=(
+        STRATEGY_UNIVARIATE_CANDIDATE_ANALYSIS.steps[0],
+        StepTemplate(
+            title="Select and merge univariate candidates",
+            tool_ref=ToolRef("strategy", "refine_univariate_candidate"),
+            inputs_template={
+                "source_artifact_id": (
+                    "$ref:Analyze univariate candidates.output.artifacts.0.artifact_id"
+                ),
+                "expected_artifact_content_hash": (
+                    "$ref:Analyze univariate candidates.output.artifacts.0.content_hash"
+                ),
+                "expected_candidate_id": ("$ref:Analyze univariate candidates.output.candidate_id"),
+                "expected_evidence_hash": ("$ref:Analyze univariate candidates.output.evidence_hash"),
+                "feature": "{slot:feature}",
+                "method": "{slot:method}",
+                "merge_groups": "{slot:merge_groups}",
+                "selection": "{slot:selection}",
+                "selection_reason": "{slot:selection_reason}",
+            },
+            depends_on_titles=("Analyze univariate candidates",),
+            post_checks=(
+                PostCheck("nonempty", {"field": "asset_id"}),
+                PostCheck("nonempty", {"field": "asset_hash"}),
+                PostCheck("nonempty", {"field": "effect_id"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_UNIVARIATE_CANDIDATE_REFINEMENT_EXISTING = WorkflowTemplate(
+    id="strategy_univariate_candidate_refinement_existing",
+    title="Refine existing univariate candidates",
+    goal_patterns=(
+        "Select an existing candidate",
+        "Merge Existing Boxes",
+        "refine existing univariate candidate",
+    ),
+    slots=(
+        SlotSpec(
+            "source_artifact_id", True, "task_context", "Bound source JSON artifact"
+        ),
+        SlotSpec(
+            "expected_artifact_content_hash",
+            True,
+            "task_context",
+            "Bound source artifact content hash",
+        ),
+        SlotSpec(
+            "expected_candidate_id",
+            True,
+            "user",
+            "Candidate id explicitly copied from the user's request",
+        ),
+        SlotSpec(
+            "expected_evidence_hash",
+            True,
+            "task_context",
+            "Bound parent evidence hash",
+        ),
+        SlotSpec("feature", True, "user", "Feature to refine from candidate evidence"),
+        SlotSpec("method", True, "user", "Binning method to refine"),
+        SlotSpec("merge_groups", False, "user", "Explicit source bin id merge groups"),
+        SlotSpec("selection", True, "user", "Explicit bins or risk threshold"),
+        SlotSpec("selection_reason", False, "user", "Optional user-owned rationale"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Select and merge existing univariate candidates",
+            tool_ref=ToolRef("strategy", "refine_univariate_candidate"),
+            inputs_template={
+                "source_artifact_id": "{slot:source_artifact_id}",
+                "expected_artifact_content_hash": (
+                    "{slot:expected_artifact_content_hash}"
+                ),
+                "expected_candidate_id": "{slot:expected_candidate_id}",
+                "expected_evidence_hash": "{slot:expected_evidence_hash}",
+                "feature": "{slot:feature}",
+                "method": "{slot:method}",
+                "merge_groups": "{slot:merge_groups}",
+                "selection": "{slot:selection}",
+                "selection_reason": "{slot:selection_reason}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "asset_id"}),
+                PostCheck("nonempty", {"field": "asset_hash"}),
+                PostCheck("nonempty", {"field": "effect_id"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_CANDIDATE_MONTHLY_STABILITY = WorkflowTemplate(
+    id="strategy_candidate_monthly_stability",
+    title="Measure candidate stability by month",
+    goal_patterns=(
+        "Candidates for month-to-month stability",
+        "Candidates for the MonthPSI",
+        "candidate monthly stability",
+        "candidate monthly PSI",
+    ),
+    slots=(
+        SlotSpec(
+            "source_kind",
+            True,
+            "task_context",
+            "Platform-verified univariate asset or Pool-entry source kind",
+        ),
+        SlotSpec(
+            "source_artifact_id",
+            False,
+            "task_context",
+            "Exact task-owned univariate candidate asset artifact",
+        ),
+        SlotSpec(
+            "expected_artifact_content_hash",
+            False,
+            "task_context",
+            "Exact candidate asset artifact content hash",
+        ),
+        SlotSpec(
+            "expected_asset_id",
+            False,
+            "task_context",
+            "Verified univariate candidate asset id",
+        ),
+        SlotSpec(
+            "expected_asset_hash",
+            False,
+            "task_context",
+            "Verified univariate candidate asset hash",
+        ),
+        SlotSpec(
+            "strategy_type",
+            False,
+            "task_context",
+            "Verified current Pool type for a Pool-entry source",
+        ),
+        SlotSpec(
+            "expected_pool_revision",
+            False,
+            "task_context",
+            "Exact current Pool revision",
+        ),
+        SlotSpec(
+            "expected_pool_snapshot_hash",
+            False,
+            "task_context",
+            "Exact current Pool snapshot hash",
+        ),
+        SlotSpec(
+            "entry_id",
+            False,
+            "task_context",
+            "Verified univariate entry in the exact current Pool revision",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Measure candidate stability by month",
+            tool_ref=ToolRef("strategy", "measure_candidate_monthly_stability"),
+            inputs_template={
+                "source_kind": "{slot:source_kind}",
+                "source_artifact_id": "{slot:source_artifact_id}",
+                "expected_artifact_content_hash": (
+                    "{slot:expected_artifact_content_hash}"
+                ),
+                "expected_asset_id": "{slot:expected_asset_id}",
+                "expected_asset_hash": "{slot:expected_asset_hash}",
+                "strategy_type": "{slot:strategy_type}",
+                "expected_pool_revision": "{slot:expected_pool_revision}",
+                "expected_pool_snapshot_hash": (
+                    "{slot:expected_pool_snapshot_hash}"
+                ),
+                "entry_id": "{slot:entry_id}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "stability_id"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_SCORECARD_MODEL_SCORE_EVIDENCE_BUILD = WorkflowTemplate(
+    id="strategy_scorecard_model_score_evidence_build",
+    title="Train and score a scorecard",
+    goal_patterns=(
+        "TrainingScorecard And generate rating evidence.",
+        "Generate model evidence for scorecard",
+        "train scorecard and materialize score evidence",
+    ),
+    slots=(
+        SlotSpec(
+            "sample_design_ref",
+            True,
+            "task_context",
+            "Latest fully authenticated StrategySampleDesign V2 pair",
+        ),
+        SlotSpec(
+            "features",
+            True,
+            "user",
+            "Explicit non-target scorecard feature columns",
+        ),
+        SlotSpec(
+            "params",
+            True,
+            "user",
+            "Bounded scorecard training parameters",
+        ),
+        SlotSpec("seed", True, "user", "Explicit deterministic training seed"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Train the scorecard",
+            tool_ref=ToolRef("modeling", "train_model_with_evidence_v2"),
+            inputs_template={
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "recipe": "scorecard",
+                "features": "{slot:features}",
+                "params": "{slot:params}",
+                "seed": "{slot:seed}",
+                "early_stopping_rounds": None,
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "experiment_id"}),
+                PostCheck("nonempty", {"field": "model_artifact_id"}),
+                PostCheck("nonempty", {"field": "evidence_id"}),
+                PostCheck("nonempty", {"field": "evidence_content_hash"}),
+                PostCheck(
+                    "nonempty",
+                    {"field": "artifacts.model_binary.artifact_id"},
+                ),
+                PostCheck(
+                    "nonempty",
+                    {"field": "artifacts.training_evidence.artifact_id"},
+                ),
+            ),
+            needs_confirmation=False,
+        ),
+        StepTemplate(
+            title="Generate model scores",
+            tool_ref=ToolRef("modeling", "materialize_model_score_evidence_v2"),
+            inputs_template={
+                "training_evidence_ref": {
+                    "sample_design_ref": (
+                        "$ref:Train the scorecard.output.sample_design_ref"
+                    ),
+                    "model_binary_artifact_id": (
+                        "$ref:Train the scorecard.output.artifacts.model_binary.artifact_id"
+                    ),
+                    "expected_model_binary_artifact_content_hash": (
+                        "$ref:Train the scorecard.output.artifacts.model_binary.content_hash"
+                    ),
+                    "evidence_artifact_id": (
+                        "$ref:Train the scorecard.output.artifacts.training_evidence.artifact_id"
+                    ),
+                    "expected_evidence_artifact_content_hash": (
+                        "$ref:Train the scorecard.output.artifacts.training_evidence.content_hash"
+                    ),
+                    "expected_experiment_id": (
+                        "$ref:Train the scorecard.output.experiment_id"
+                    ),
+                    "expected_model_artifact_id": (
+                        "$ref:Train the scorecard.output.model_artifact_id"
+                    ),
+                    "expected_evidence_id": (
+                        "$ref:Train the scorecard.output.evidence_id"
+                    ),
+                    "expected_evidence_content_hash": (
+                        "$ref:Train the scorecard.output.evidence_content_hash"
+                    ),
+                }
+            },
+            depends_on_titles=("Train the scorecard",),
+            post_checks=(
+                PostCheck("nonempty", {"field": "evidence_id"}),
+                PostCheck("nonempty", {"field": "evidence_content_hash"}),
+                PostCheck(
+                    "nonempty",
+                    {"field": "artifacts.score_vector.artifact_id"},
+                ),
+                PostCheck(
+                    "nonempty",
+                    {"field": "artifacts.score_evidence.artifact_id"},
+                ),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_SCORECARD_BAND_BUILD = WorkflowTemplate(
+    id="strategy_scorecard_band_build",
+    title="Build scorecard bands",
+    goal_patterns=(
+        "BuildScorecard Split Belt",
+        "Generate scorecard fractional bands",
+        "build scorecard bands",
+    ),
+    slots=(
+        SlotSpec(
+            "score_evidence_ref",
+            True,
+            "task_context",
+            "Latest fully authenticated task-owned score evidence and vector",
+        ),
+        SlotSpec(
+            "sample_design_ref",
+            True,
+            "task_context",
+            "Latest fully authenticated compatible StrategySampleDesign V2 pair",
+        ),
+        SlotSpec(
+            "banding",
+            False,
+            "user",
+            "Canonical equal-frequency banding derived from explicit bin_count",
+        ),
+        SlotSpec(
+            "raw_pd_band_edges",
+            False,
+            "user",
+            "Explicit complete raw-PD band edges",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Build scorecard bands",
+            tool_ref=ToolRef("strategy", "build_scorecard_band_asset"),
+            inputs_template={
+                "score_evidence_ref": "{slot:score_evidence_ref}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "banding": "{slot:banding}",
+                "raw_pd_band_edges": "{slot:raw_pd_band_edges}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "asset_id"}),
+                PostCheck("nonempty", {"field": "asset_hash"}),
+                PostCheck("nonempty", {"field": "scorecard_band_asset"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_SCORECARD_CUTOFF_SELECTION = WorkflowTemplate(
+    id="strategy_scorecard_cutoff_selection",
+    title="Create a candidate from a scorecard cutoff",
+    goal_patterns=(
+        "SelectionScorecard cutoff",
+        "The physico-rated scorecard passes through the line",
+        "select scorecard cutoff",
+    ),
+    slots=(
+        SlotSpec(
+            "source_artifact_id",
+            True,
+            "task_context",
+            "Exact authenticated scorecard-band artifact id",
+        ),
+        SlotSpec(
+            "expected_source_artifact_content_hash",
+            True,
+            "task_context",
+            "Exact scorecard-band artifact content hash",
+        ),
+        SlotSpec(
+            "expected_asset_id",
+            True,
+            "task_context",
+            "Verified scorecard-band asset id",
+        ),
+        SlotSpec(
+            "expected_asset_hash",
+            True,
+            "task_context",
+            "Verified scorecard-band asset hash",
+        ),
+        SlotSpec("cutoff_id", True, "user", "Exact cutoff pointer selected by user"),
+        SlotSpec("reason", False, "user", "Optional verbatim selection rationale"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Create a candidate from a scorecard cutoff",
+            tool_ref=ToolRef(
+                "strategy",
+                "materialize_scorecard_cutoff_selection",
+            ),
+            inputs_template={
+                "source_artifact_id": "{slot:source_artifact_id}",
+                "expected_source_artifact_content_hash": (
+                    "{slot:expected_source_artifact_content_hash}"
+                ),
+                "expected_asset_id": "{slot:expected_asset_id}",
+                "expected_asset_hash": "{slot:expected_asset_hash}",
+                "cutoff_id": "{slot:cutoff_id}",
+                "reason": "{slot:reason}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "selection_id"}),
+                PostCheck("nonempty", {"field": "selection_hash"}),
+                PostCheck("nonempty", {"field": "cutoff_id"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_POOL_ADD_CANDIDATE = WorkflowTemplate(
+    id="strategy_pool_add_candidate",
+    title="Add a candidate to a Strategy Pool",
+    goal_patterns=("Candidates for pool", "Add Candidate Rule", "add candidate to strategy pool"),
+    slots=(
+        SlotSpec("source_artifact_id", True, "task_context", "Bound candidate asset artifact"),
+        SlotSpec(
+            "expected_artifact_content_hash",
+            True,
+            "task_context",
+            "Bound candidate artifact content hash",
+        ),
+        SlotSpec("expected_asset_id", True, "task_context", "Verified candidate asset id"),
+        SlotSpec("expected_asset_hash", True, "task_context", "Verified candidate asset hash"),
+        SlotSpec("strategy_type", True, "user", "Typed Strategy Pool kind"),
+        SlotSpec("default_action", True, "user", "Explicit typed default action"),
+        SlotSpec("action", True, "user", "Explicit typed action for the candidate rule"),
+        SlotSpec(
+            "placement_mode",
+            True,
+            "user",
+            "Voting placement semantics or platform-bound append for ordinary candidates",
+        ),
+        # Planner's required-slot check treats the valid absent-pool revision
+        # ``0`` as falsy.  Keep this Planner-optional while the template and
+        # Tool schema still require and carry the platform-bound CAS value.
+        SlotSpec("expected_pool_revision", False, "task_context", "Current Pool CAS revision"),
+        SlotSpec(
+            "expected_pool_snapshot_hash",
+            True,
+            "task_context",
+            "Current Pool CAS snapshot hash",
+        ),
+        SlotSpec("reason", False, "user", "Optional user-owned edit rationale"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Add the candidate to the Strategy Pool",
+            tool_ref=ToolRef("strategy", "add_candidate_to_pool"),
+            inputs_template={
+                "source_artifact_id": "{slot:source_artifact_id}",
+                "expected_artifact_content_hash": "{slot:expected_artifact_content_hash}",
+                "expected_asset_id": "{slot:expected_asset_id}",
+                "expected_asset_hash": "{slot:expected_asset_hash}",
+                "strategy_type": "{slot:strategy_type}",
+                "default_action": "{slot:default_action}",
+                "action": "{slot:action}",
+                "placement_mode": "{slot:placement_mode}",
+                "expected_pool_revision": "{slot:expected_pool_revision}",
+                "expected_pool_snapshot_hash": "{slot:expected_pool_snapshot_hash}",
+                "reason": "{slot:reason}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "pool_id"}),
+                PostCheck("nonempty", {"field": "snapshot_hash"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_POOL_REMOVE_ENTRY = WorkflowTemplate(
+    id="strategy_pool_remove_entry",
+    title="Remove a Strategy Pool entry",
+    goal_patterns=("Policy pool delete rules", "Remove pool entry", "remove strategy pool entry"),
+    slots=(
+        SlotSpec("strategy_type", True, "user", "Typed Strategy Pool kind"),
+        SlotSpec("rule_id", True, "task_context", "Verified rule id from the current Pool"),
+        SlotSpec("expected_pool_revision", True, "task_context", "Current Pool CAS revision"),
+        SlotSpec(
+            "expected_pool_snapshot_hash",
+            True,
+            "task_context",
+            "Current Pool CAS snapshot hash",
+        ),
+        SlotSpec("reason", False, "user", "Optional user-owned edit rationale"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Remove the Strategy Pool entry",
+            tool_ref=ToolRef("strategy", "remove_pool_entry"),
+            inputs_template={
+                "strategy_type": "{slot:strategy_type}",
+                "rule_id": "{slot:rule_id}",
+                "expected_pool_revision": "{slot:expected_pool_revision}",
+                "expected_pool_snapshot_hash": "{slot:expected_pool_snapshot_hash}",
+                "reason": "{slot:reason}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "pool_id"}),
+                PostCheck("nonempty", {"field": "snapshot_hash"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_POOL_SET_ACTION = WorkflowTemplate(
+    id="strategy_pool_set_action",
+    title="Change a Strategy Pool action",
+    goal_patterns=("Modify pool rule action", "Policy pool action", "set strategy pool entry action"),
+    slots=(
+        SlotSpec("strategy_type", True, "user", "Typed Strategy Pool kind"),
+        SlotSpec("rule_id", True, "task_context", "Verified rule id from the current Pool"),
+        SlotSpec("action", True, "user", "Explicit typed replacement action"),
+        SlotSpec("expected_pool_revision", True, "task_context", "Current Pool CAS revision"),
+        SlotSpec(
+            "expected_pool_snapshot_hash",
+            True,
+            "task_context",
+            "Current Pool CAS snapshot hash",
+        ),
+        SlotSpec("reason", False, "user", "Optional user-owned edit rationale"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Change the pool entry action",
+            tool_ref=ToolRef("strategy", "set_pool_entry_action"),
+            inputs_template={
+                "strategy_type": "{slot:strategy_type}",
+                "rule_id": "{slot:rule_id}",
+                "action": "{slot:action}",
+                "expected_pool_revision": "{slot:expected_pool_revision}",
+                "expected_pool_snapshot_hash": "{slot:expected_pool_snapshot_hash}",
+                "reason": "{slot:reason}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "pool_id"}),
+                PostCheck("nonempty", {"field": "snapshot_hash"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_POOL_REORDER = WorkflowTemplate(
+    id="strategy_pool_reorder",
+    title="Reorder a Strategy Pool",
+    goal_patterns=("Policy pool full sorting", "Full Reordering Rules", "reorder strategy pool"),
+    slots=(
+        SlotSpec("strategy_type", True, "user", "Typed Strategy Pool kind"),
+        SlotSpec("ordered_rule_ids", True, "task_context", "Verified complete rule-id order"),
+        SlotSpec("expected_pool_revision", True, "task_context", "Current Pool CAS revision"),
+        SlotSpec(
+            "expected_pool_snapshot_hash",
+            True,
+            "task_context",
+            "Current Pool CAS snapshot hash",
+        ),
+        SlotSpec("reason", False, "user", "Optional user-owned edit rationale"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Save the Strategy Pool order",
+            tool_ref=ToolRef("strategy", "reorder_strategy_pool"),
+            inputs_template={
+                "strategy_type": "{slot:strategy_type}",
+                "ordered_rule_ids": "{slot:ordered_rule_ids}",
+                "expected_pool_revision": "{slot:expected_pool_revision}",
+                "expected_pool_snapshot_hash": "{slot:expected_pool_snapshot_hash}",
+                "reason": "{slot:reason}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "pool_id"}),
+                PostCheck("nonempty", {"field": "snapshot_hash"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_POOL_COMPILE = WorkflowTemplate(
+    id="strategy_pool_compile",
+    title="Preview a Strategy Pool",
+    goal_patterns=("Preview Policy Pool", "Draft compilation strategy pool", "compile strategy pool"),
+    slots=(
+        SlotSpec("strategy_type", True, "user", "Typed Strategy Pool kind"),
+        SlotSpec("expected_pool_revision", True, "task_context", "Current Pool revision"),
+        SlotSpec(
+            "expected_pool_snapshot_hash",
+            True,
+            "task_context",
+            "Current Pool snapshot hash",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Compile the pool preview",
+            tool_ref=ToolRef("strategy", "compile_strategy_pool"),
+            inputs_template={
+                "strategy_type": "{slot:strategy_type}",
+                "expected_pool_revision": "{slot:expected_pool_revision}",
+                "expected_pool_snapshot_hash": "{slot:expected_pool_snapshot_hash}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "design_hash"}),
+                PostCheck("nonempty", {"field": "strategy_spec"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_POOL_MATERIALIZE = WorkflowTemplate(
+    id="strategy_pool_materialize",
+    title="Create a draft strategy from a pool",
+    goal_patterns=(
+        "Turn the current policy pool into a draft policy",
+        "Create From Current Policy Pooldraft Strategy",
+        "materialize current strategy pool as a draft strategy",
+    ),
+    slots=(
+        SlotSpec("strategy_type", True, "user", "Explicit Strategy Pool type"),
+        SlotSpec(
+            "expected_pool_revision",
+            True,
+            "task_context",
+            "Authenticated current Pool revision",
+        ),
+        SlotSpec(
+            "expected_pool_snapshot_hash",
+            True,
+            "task_context",
+            "Authenticated current Pool snapshot hash",
+        ),
+        SlotSpec(
+            "expected_pool_artifact_id",
+            True,
+            "task_context",
+            "Authenticated current Pool artifact id",
+        ),
+        SlotSpec(
+            "expected_pool_artifact_content_hash",
+            True,
+            "task_context",
+            "Authenticated current Pool artifact content hash",
+        ),
+        SlotSpec(
+            "expected_design_hash",
+            True,
+            "task_context",
+            "Authenticated compiled Pool design hash",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Create or reuse the draft strategy",
+            tool_ref=ToolRef("strategy", "materialize_strategy_from_pool"),
+            inputs_template={
+                "strategy_type": "{slot:strategy_type}",
+                "expected_pool_revision": "{slot:expected_pool_revision}",
+                "expected_pool_snapshot_hash": (
+                    "{slot:expected_pool_snapshot_hash}"
+                ),
+                "expected_pool_artifact_id": (
+                    "{slot:expected_pool_artifact_id}"
+                ),
+                "expected_pool_artifact_content_hash": (
+                    "{slot:expected_pool_artifact_content_hash}"
+                ),
+                "expected_design_hash": "{slot:expected_design_hash}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "schema_version"}),
+                PostCheck("nonempty", {"field": "materialization_id"}),
+                PostCheck("nonempty", {"field": "strategy_ref.strategy_id"}),
+                PostCheck(
+                    "nonempty",
+                    {"field": "strategy_ref.strategy_spec_hash"},
+                ),
+                PostCheck("nonempty", {"field": "pool_ref.revision_id"}),
+                PostCheck("nonempty", {"field": "lifecycle.current_status"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_POOL_APPLY = WorkflowTemplate(
+    id="strategy_pool_apply",
+    title="Apply the current Strategy Pool",
+    goal_patterns=(
+        "Apply the current policy pool to the current sample",
+        "Write the current policy pool back to the derivative data set",
+        "apply current strategy pool",
+    ),
+    slots=(
+        SlotSpec("strategy_type", True, "user", "Explicit Strategy Pool type"),
+        SlotSpec(
+            "output_prefix",
+            False,
+            "user",
+            "Optional safe ASCII output-column prefix",
+        ),
+        SlotSpec(
+            "expected_pool_revision",
+            True,
+            "task_context",
+            "Current nonempty Pool CAS revision",
+        ),
+        SlotSpec(
+            "expected_pool_snapshot_hash",
+            True,
+            "task_context",
+            "Current nonempty Pool CAS snapshot hash",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Apply the pool and create a derived dataset",
+            tool_ref=ToolRef("strategy", "apply_strategy_pool"),
+            inputs_template={
+                "strategy_type": "{slot:strategy_type}",
+                "output_prefix": "{slot:output_prefix}",
+                "expected_pool_revision": "{slot:expected_pool_revision}",
+                "expected_pool_snapshot_hash": (
+                    "{slot:expected_pool_snapshot_hash}"
+                ),
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "schema_version"}),
+                PostCheck("nonempty", {"field": "run_id"}),
+                PostCheck("nonempty", {"field": "result.dataset_id"}),
+                PostCheck("range", {"field": "result.row_count", "min": 0}),
+                PostCheck("nonempty", {"field": "evidence.artifact_id"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_POOL_VALIDATION = WorkflowTemplate(
+    id="strategy_pool_validation",
+    title="Validate a Strategy Pool on independent samples",
+    goal_patterns=(
+        "Perform independent sample playback validation for the current policy pool",
+        "Yes.validation orOOT Last Play Current Policy Pool",
+        "independent replay validation for current strategy pool",
+    ),
+    slots=(
+        SlotSpec(
+            "strategy_type",
+            True,
+            "user",
+            "Explicit approval/reject/limit/pricing/segmentation Pool type",
+        ),
+        SlotSpec(
+            "partition",
+            True,
+            "user",
+            "Explicit independent validation or OOT partition",
+        ),
+        SlotSpec(
+            "pool_ref",
+            True,
+            "task_context",
+            "Authenticated current nonempty Pool artifact and CAS identity",
+        ),
+        SlotSpec(
+            "sample_design_ref",
+            True,
+            "task_context",
+            "Exact mature StrategySampleDesign V2 membership/bundle pair",
+        ),
+        SlotSpec(
+            "population",
+            True,
+            "task_context",
+            "Platform-owned risk population selector",
+        ),
+        SlotSpec(
+            "comparison_mode",
+            True,
+            "task_context",
+            "Platform-owned absolute replay mode",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Run independent sample validation",
+            tool_ref=ToolRef("strategy", "measure_strategy_pool_validation"),
+            inputs_template={
+                "strategy_type": "{slot:strategy_type}",
+                "partition": "{slot:partition}",
+                "pool_ref": "{slot:pool_ref}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "population": "{slot:population}",
+                "comparison_mode": "{slot:comparison_mode}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "schema_version"}),
+                PostCheck("nonempty", {"field": "evidence_id"}),
+                PostCheck("nonempty", {"field": "artifact.artifact_id"}),
+                PostCheck("range", {"field": "population_count", "min": 1}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_POOL_IMPACT = WorkflowTemplate(
+    id="strategy_pool_impact",
+    title="Measure Strategy Pool outcomes",
+    goal_patterns=(
+        "Measuring the impact of the policy pool",
+        "Policy poolwaterfall Retrospect",
+        "measure strategy pool impact",
+    ),
+    slots=(
+        SlotSpec("strategy_type", True, "user", "Explicit approval/reject Pool type"),
+        SlotSpec(
+            "expected_pool_revision",
+            True,
+            "task_context",
+            "Current nonempty Pool revision",
+        ),
+        SlotSpec(
+            "expected_pool_snapshot_hash",
+            True,
+            "task_context",
+            "Current Pool snapshot hash",
+        ),
+        SlotSpec("dataset_id", True, "task_context", "Active task-owned dataset id"),
+        SlotSpec(
+            "expected_dataset_content_hash",
+            True,
+            "task_context",
+            "Active dataset content hash",
+        ),
+        SlotSpec(
+            "workspace_revision",
+            True,
+            "task_context",
+            "Current DataWorkspace revision",
+        ),
+        SlotSpec(
+            "workspace_generation",
+            True,
+            "task_context",
+            "Current DataWorkspace analysis generation",
+        ),
+        SlotSpec(
+            "semantic_mapping_hash",
+            True,
+            "task_context",
+            "Confirmed semantic mapping hash",
+        ),
+        SlotSpec("target_col", True, "task_context", "Confirmed binary target column"),
+        SlotSpec(
+            "sample_design_ref",
+            True,
+            "task_context",
+            "Exact authenticated StrategySampleDesign development partition",
+        ),
+        SlotSpec(
+            "comparison_mode",
+            True,
+            "user",
+            "Absolute or explicitly requested baseline comparison",
+        ),
+        SlotSpec(
+            "baseline_strategy_id",
+            False,
+            "user",
+            "Task-owned same-type canonical baseline strategy",
+        ),
+        SlotSpec(
+            "month_col",
+            False,
+            "user",
+            "Explicit column or unique confirmed month semantic role",
+        ),
+        SlotSpec(
+            "loan_amount_col",
+            False,
+            "user",
+            "Explicit column or unique confirmed loan amount role",
+        ),
+        SlotSpec(
+            "overdue_amount_col",
+            False,
+            "user",
+            "Explicit column or unique confirmed overdue amount role",
+        ),
+        SlotSpec(
+            "drop_nan_labels",
+            False,
+            "user",
+            "Explicitly authorized risk-denominator exclusion retaining sample rows",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Calculate Strategy Pool outcomes",
+            tool_ref=ToolRef("strategy", "measure_pool_impact"),
+            inputs_template={
+                "strategy_type": "{slot:strategy_type}",
+                "expected_pool_revision": "{slot:expected_pool_revision}",
+                "expected_pool_snapshot_hash": "{slot:expected_pool_snapshot_hash}",
+                "dataset_id": "{slot:dataset_id}",
+                "expected_dataset_content_hash": (
+                    "{slot:expected_dataset_content_hash}"
+                ),
+                "workspace_revision": "{slot:workspace_revision}",
+                "workspace_generation": "{slot:workspace_generation}",
+                "semantic_mapping_hash": "{slot:semantic_mapping_hash}",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "comparison_mode": "{slot:comparison_mode}",
+                "baseline_strategy_id": "{slot:baseline_strategy_id}",
+                "month_col": "{slot:month_col}",
+                "loan_amount_col": "{slot:loan_amount_col}",
+                "overdue_amount_col": "{slot:overdue_amount_col}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "assessment_id"}),
+                PostCheck("nonempty", {"field": "content_hash"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_IMPACT_CUBE = WorkflowTemplate(
+    id="strategy_impact_cube",
+    title="Measure strategy outcomes",
+    goal_patterns=(
+        "Measuring the impact of the strategy",
+        "Verify Policy Pool Effects",
+        "measure strategy impact cube",
+    ),
+    slots=(
+        SlotSpec(
+            "strategy_type",
+            True,
+            "user",
+            "Explicit approval/reject/limit/pricing/segmentation Pool type",
+        ),
+        SlotSpec(
+            "pool_ref",
+            True,
+            "task_context",
+            "Exact current Candidate Pool artifact and revision binding",
+        ),
+        SlotSpec(
+            "sample_design_ref",
+            True,
+            "task_context",
+            "Exact authenticated StrategySampleDesign V2 artifact binding",
+        ),
+        SlotSpec(
+            "partitions",
+            True,
+            "task_context",
+            "Explicit available development/validation/OOT partitions",
+        ),
+        SlotSpec(
+            "population",
+            True,
+            "task_context",
+            "Governed risk population",
+        ),
+        SlotSpec(
+            "dimension_bindings",
+            True,
+            "user",
+            "Explicit or uniquely confirmed month/group/segment columns",
+        ),
+        SlotSpec(
+            "current_strategy_ref",
+            False,
+            "user",
+            "Optional exact same-type current strategy comparison",
+        ),
+        SlotSpec(
+            "economics_inputs",
+            False,
+            "user",
+            "Optional typed column/scalar economics bindings",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Measure strategy outcomes",
+            tool_ref=ToolRef("strategy", "measure_strategy_impact_cube"),
+            inputs_template={
+                "strategy_type": "{slot:strategy_type}",
+                "pool_ref": "{slot:pool_ref}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "partitions": "{slot:partitions}",
+                "population": "{slot:population}",
+                "dimension_bindings": "{slot:dimension_bindings}",
+                "current_strategy_ref": "{slot:current_strategy_ref}",
+                "economics_inputs": "{slot:economics_inputs}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "cube_id"}),
+                PostCheck("nonempty", {"field": "content_hash"}),
+                PostCheck("nonempty", {"field": "artifact"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_POOL_STABILITY = WorkflowTemplate(
+    id="strategy_pool_stability",
+    title="Compare Strategy Pool stability across partitions",
+    goal_patterns=(
+        "Measuring the stability of the policy pool across the zoning",
+        "Analyse the policy pool distribution drift",
+        "measure pool cross-partition stability",
+    ),
+    slots=(
+        SlotSpec(
+            "strategy_type",
+            True,
+            "user",
+            "Explicit approval/reject/limit/pricing/segmentation Pool type",
+        ),
+        SlotSpec(
+            "pool_ref",
+            True,
+            "task_context",
+            "Exact current Candidate Pool artifact and revision binding",
+        ),
+        SlotSpec(
+            "sample_design_ref",
+            True,
+            "task_context",
+            "Exact authenticated StrategySampleDesign V2 artifact binding",
+        ),
+        SlotSpec(
+            "partitions",
+            True,
+            "task_context",
+            "Development plus every available independent comparison partition",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Create the pool stability baseline",
+            tool_ref=ToolRef("strategy", "measure_strategy_impact_cube"),
+            inputs_template={
+                "strategy_type": "{slot:strategy_type}",
+                "pool_ref": "{slot:pool_ref}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "partitions": "{slot:partitions}",
+                "population": "risk",
+                "dimension_bindings": {
+                    "month_col": None,
+                    "group_col": None,
+                    "segment_col": None,
+                },
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "cube_id"}),
+                PostCheck("nonempty", {"field": "content_hash"}),
+                PostCheck("nonempty", {"field": "artifact.artifact_id"}),
+            ),
+            needs_confirmation=False,
+        ),
+        StepTemplate(
+            title="Compare pool stability across partitions",
+            tool_ref=ToolRef("strategy", "measure_strategy_pool_stability"),
+            inputs_template={
+                "artifact_id": (
+                    "$ref:Create the pool stability baseline.output.artifact.artifact_id"
+                ),
+                "expected_artifact_content_hash": (
+                    "$ref:Create the pool stability baseline.output.artifact.content_hash"
+                ),
+                "expected_cube_id": (
+                    "$ref:Create the pool stability baseline.output.cube_id"
+                ),
+                "expected_cube_content_hash": (
+                    "$ref:Create the pool stability baseline.output.content_hash"
+                ),
+            },
+            depends_on_titles=("Create the pool stability baseline",),
+            post_checks=(
+                PostCheck("nonempty", {"field": "stability_id"}),
+                PostCheck("nonempty", {"field": "content_hash"}),
+                PostCheck("nonempty", {"field": "artifact.artifact_id"}),
+                PostCheck("nonempty", {"field": "comparison_partitions"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_DSL_DELIVERY = WorkflowTemplate(
+    id="strategy_dsl_delivery",
+    title="Export strategy code and equivalence checks",
+    goal_patterns=(
+        "Export Policy Code",
+        "Generate PolicyPython SQL JSON",
+        "export strategy delivery",
+        "export strategy code",
+    ),
+    slots=(
+        SlotSpec(
+            "strategy_ref",
+            True,
+            "task_context",
+            "Exact task-owned strategy id, type, version, and spec hash",
+        ),
+        SlotSpec(
+            "dataset_ref",
+            True,
+            "task_context",
+            "Exact active task-owned dataset id and content hash",
+        ),
+        SlotSpec(
+            "workspace_ref",
+            True,
+            "task_context",
+            "Exact DataWorkspace revision, generation, semantics, and active dataset",
+        ),
+        SlotSpec(
+            "maximum_equivalence_rows",
+            True,
+            "task_context",
+            "Platform-fixed deterministic equivalence sample budget",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Export strategy code and verify equivalent results",
+            tool_ref=ToolRef("strategy", "export_strategy_delivery"),
+            inputs_template={
+                "strategy_ref": "{slot:strategy_ref}",
+                "dataset_ref": "{slot:dataset_ref}",
+                "workspace_ref": "{slot:workspace_ref}",
+                "maximum_equivalence_rows": (
+                    "{slot:maximum_equivalence_rows}"
+                ),
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "delivery_id"}),
+                PostCheck(
+                    "nonempty",
+                    {"field": "equivalence.equivalence_id"},
+                ),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_REPORT_BUNDLE_V2 = WorkflowTemplate(
+    id="strategy_report_bundle_v2",
+    title="Generate strategy reports",
+    goal_patterns=(
+        "Generate policy iterative review reports",
+        "Generate reports on governance strategies",
+        "generate governed strategy report",
+        "build strategy review report",
+    ),
+    slots=(
+        SlotSpec("title", True, "user", "Explicit or deterministic default report title"),
+        SlotSpec(
+            "status",
+            True,
+            "user",
+            "Explicit or deterministic default draft/partial/final status",
+        ),
+        SlotSpec(
+            "project_context_ref",
+            True,
+            "task_context",
+            "Exact authenticated current ProjectContext artifact and revision",
+        ),
+        SlotSpec(
+            "sample_design_ref",
+            True,
+            "task_context",
+            "Exact latest authenticated StrategySampleDesign V2 pair",
+        ),
+        SlotSpec(
+            "candidate_pool_ref",
+            True,
+            "task_context",
+            "Exact current nonempty typed Candidate Pool",
+        ),
+        SlotSpec(
+            "pool_validation_refs",
+            True,
+            "task_context",
+            "Zero to two exact authenticated independent replay evidence refs",
+        ),
+        SlotSpec(
+            "pool_impact_ref",
+            False,
+            "task_context",
+            "Legacy exact development PoolImpact for approval/reject fallback",
+        ),
+        SlotSpec(
+            "impact_cube_ref",
+            False,
+            "task_context",
+            "Preferred latest exact authenticated ImpactCube for the bound Pool",
+        ),
+        SlotSpec(
+            "pool_stability_ref",
+            False,
+            "task_context",
+            "Optional exact authenticated PoolStability for the bound ImpactCube",
+        ),
+        SlotSpec(
+            "candidate_stability_ref",
+            False,
+            "task_context",
+            "Optional exact authenticated candidate monthly stability evidence",
+        ),
+        SlotSpec(
+            "voting_candidate_search_ref",
+            False,
+            "task_context",
+            "Optional exact authenticated Voting candidate search evidence",
+        ),
+        SlotSpec(
+            "cross_candidate_search_ref",
+            False,
+            "task_context",
+            "Optional exact authenticated Cross candidate search evidence",
+        ),
+        SlotSpec(
+            "cross_rule_search_ref",
+            False,
+            "task_context",
+            "Optional exact authenticated 2D/3D Cross rule search evidence",
+        ),
+        SlotSpec(
+            "report_revision",
+            True,
+            "task_context",
+            "Next report-head CAS revision",
+        ),
+        SlotSpec(
+            "previous_report_id",
+            False,
+            "task_context",
+            "Exact previous report head id",
+        ),
+        SlotSpec(
+            "previous_report_content_hash",
+            False,
+            "task_context",
+            "Exact previous report head content hash",
+        ),
+        SlotSpec(
+            "generated_at",
+            True,
+            "task_context",
+            "Platform-generated current UTC timestamp",
+        ),
+        SlotSpec(
+            "strategy_identity",
+            False,
+            "task_context",
+            "Unique exact task-owned persisted strategy identity, when resolvable",
+        ),
+        SlotSpec(
+            "model_evidence_ref",
+            False,
+            "task_context",
+            "Optional latest fully authenticated compatible ModelEvidence",
+        ),
+        SlotSpec(
+            "training_evidence_ref",
+            False,
+            "task_context",
+            "Optional latest fully authenticated compatible training evidence",
+        ),
+        SlotSpec(
+            "score_evidence_ref",
+            False,
+            "task_context",
+            "Optional latest fully authenticated compatible score evidence",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Generate reports for strategy review",
+            tool_ref=ToolRef("strategy", "build_report_bundle_v2"),
+            inputs_template={
+                "title": "{slot:title}",
+                "status": "{slot:status}",
+                "project_context_ref": "{slot:project_context_ref}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "candidate_pool_ref": "{slot:candidate_pool_ref}",
+                "pool_validation_refs": "{slot:pool_validation_refs}",
+                "pool_impact_ref": "{slot:pool_impact_ref}",
+                "impact_cube_ref": "{slot:impact_cube_ref}",
+                "pool_stability_ref": "{slot:pool_stability_ref}",
+                "candidate_stability_ref": "{slot:candidate_stability_ref}",
+                "voting_candidate_search_ref": (
+                    "{slot:voting_candidate_search_ref}"
+                ),
+                "cross_candidate_search_ref": (
+                    "{slot:cross_candidate_search_ref}"
+                ),
+                "cross_rule_search_ref": "{slot:cross_rule_search_ref}",
+                "report_revision": "{slot:report_revision}",
+                "previous_report_id": "{slot:previous_report_id}",
+                "previous_report_content_hash": (
+                    "{slot:previous_report_content_hash}"
+                ),
+                "generated_at": "{slot:generated_at}",
+                "strategy_identity": "{slot:strategy_identity}",
+                "model_evidence_ref": "{slot:model_evidence_ref}",
+                "training_evidence_ref": "{slot:training_evidence_ref}",
+                "score_evidence_ref": "{slot:score_evidence_ref}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "report_id"}),
+                PostCheck("nonempty", {"field": "report_revision"}),
+                PostCheck("nonempty", {"field": "content_hash"}),
+                PostCheck("nonempty", {"field": "artifacts"}),
+            ),
+            needs_confirmation=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+_LIMIT_PRICING_INPUTS = {
+    "dataset_id": "{slot:dataset_id}",
+    "sample_design_ref": "{slot:sample_design_ref}",
+    "score_col": "{slot:score_col}",
+    "target_col": "{slot:target_col}",
+    "pd_col": "{slot:pd_col}",
+    "band_edges": "{slot:band_edges}",
+    "n_bands": "{slot:n_bands}",
+    "limit_grid": "{slot:limit_grid}",
+    "rate_grid": "{slot:rate_grid}",
+    "lgd": "{slot:lgd}",
+    "funding_rate": "{slot:funding_rate}",
+    "term_months": "{slot:term_months}",
+    "cost_per_loan": "{slot:cost_per_loan}",
+    "el_ead_max": "{slot:el_ead_max}",
+    "strategy_id": "{slot:strategy_id}",
+    "drop_nan_labels": "{slot:drop_nan_labels}",
+}
+
+
+STRATEGY_LIMIT_PRICING_ANALYSIS = WorkflowTemplate(
+    id="strategy_limit_pricing_analysis",
+    title="Limit and pricing matrix analysis",
+    goal_patterns=("Line pricing matrix", "Level and pricing analysis", "limit pricing matrix"),
+    slots=(
+        SlotSpec(
+            "dataset_id", True, "task_context", "Registered task-owned dataset id"
+        ),
+        _STRATEGY_SAMPLE_DESIGN_REF_SLOT,
+        SlotSpec("score_col", True, "user", "Score column"),
+        SlotSpec(
+            "pd_col",
+            False,
+            "user",
+            "Calibrated PD column; mutually exclusive with target_col",
+        ),
+        SlotSpec(
+            "target_col",
+            False,
+            "user",
+            "Binary target used as PD proxy; mutually exclusive with pd_col",
+        ),
+        SlotSpec("limit_grid", True, "user", "Candidate limits"),
+        SlotSpec("rate_grid", True, "user", "Candidate annual rates"),
+        SlotSpec("funding_rate", True, "user", "Annual funding rate"),
+        SlotSpec("term_months", True, "user", "Term in months"),
+        SlotSpec("cost_per_loan", True, "user", "Operating cost per loan"),
+        SlotSpec("band_edges", False, "user", "Optional explicit score band edges"),
+        SlotSpec(
+            "n_bands", False, "user", "Number of score bands when edges are omitted"
+        ),
+        SlotSpec("lgd", False, "user", "Loss given default; default 0.6"),
+        SlotSpec("el_ead_max", False, "user", "Maximum feasible EL/EAD ratio"),
+        SlotSpec(
+            "strategy_id",
+            False,
+            "task_context",
+            "Optional task-owned limit/pricing strategy id",
+        ),
+        SlotSpec(
+            "drop_nan_labels", False, "user", "Confirmed target null-row exclusion"
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Calculate the pricing matrix",
+            tool_ref=ToolRef("strategy", "limit_pricing_matrix"),
+            inputs_template={**_LIMIT_PRICING_INPUTS, "confirm": False},
+            depends_on_titles=(),
+            post_checks=(PostCheck("nonempty", {"field": "matrix"}),),
+            decision_point=True,
+        ),
+        StepTemplate(
+            title="Export the pricing matrix",
+            tool_ref=ToolRef("strategy", "limit_pricing_matrix"),
+            inputs_template={
+                **_LIMIT_PRICING_INPUTS,
+                "expected_source_hash": (
+                    "$ref:Calculate the pricing matrix.output.source_dataset_content_hash"
+                ),
+                "confirm": True,
+            },
+            depends_on_titles=("Calculate the pricing matrix",),
+            post_checks=(PostCheck("nonempty", {"field": "artifacts"}),),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+DETERMINISTIC_STRATEGY_CANDIDATE_DEVELOPMENT = WorkflowTemplate(
+    id="deterministic_strategy_candidate_development",
+    title="Develop limit, pricing, or segmentation candidates",
+    goal_patterns=(
+        "Scaled candidate strategy development",
+        "Price-fixing candidate strategy development",
+        "Group candidate strategy development",
+        "deterministic strategy candidate development",
+    ),
+    slots=(
+        SlotSpec(
+            "dataset_id", True, "task_context", "Registered task-owned dataset id"
+        ),
+        SlotSpec(
+            "target_col", True, "task_context", "Server-bound binary target column"
+        ),
+        _STRATEGY_SAMPLE_DESIGN_REF_SLOT,
+        SlotSpec(
+            "drop_nan_labels", False, "user", "Confirmed target null-row exclusion"
+        ),
+        SlotSpec(
+            "strategy_type",
+            True,
+            "task_context",
+            "One of limit, pricing, or segmentation",
+        ),
+        SlotSpec(
+            "candidate_design",
+            True,
+            "user",
+            "Validated candidate search space without rules, metrics, or recommendations",
+        ),
+        SlotSpec(
+            "economics_inputs",
+            False,
+            "user",
+            "Complete limit/pricing economics; omitted only for segmentation",
+        ),
+        SlotSpec(
+            "baseline_strategy_id",
+            False,
+            "user",
+            "Optional task-owned baseline of the same strategy type",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Design a strategy candidate",
+            tool_ref=ToolRef("strategy", "design_strategy_candidate"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+                "strategy_type": "{slot:strategy_type}",
+                "candidate_design": "{slot:candidate_design}",
+                "economics_inputs": "{slot:economics_inputs}",
+                # The LLM/user cannot choose the algorithm version.  The platform
+                # pins it here and the deterministic kernel rejects all others.
+                "candidate_policy_version": CANDIDATE_POLICY_VERSION,
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "strategy_spec"}),
+                PostCheck("nonempty", {"field": "strategy_effect_hash"}),
+                PostCheck("nonempty", {"field": "design_evidence"}),
+            ),
+        ),
+        StepTemplate(
+            title="Build the strategy candidate",
+            tool_ref=ToolRef("strategy", "build_strategy"),
+            inputs_template={
+                "strategy_spec": "$ref:Design a strategy candidate.output.strategy_spec",
+                "description": "Platform-designed deterministic strategy candidate",
+            },
+            depends_on_titles=("Design a strategy candidate",),
+            post_checks=(PostCheck("nonempty", {"field": "strategy_id"}),),
+        ),
+        StepTemplate(
+            title="Backtest the strategy candidate",
+            tool_ref=ToolRef("strategy", "backtest_strategy"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "strategy_id": "$ref:Build the strategy candidate.output.strategy_id",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+                "baseline_strategy_id": "{slot:baseline_strategy_id}",
+                # Reuse the normalized bundle emitted by design so candidate
+                # selection and backtest cannot silently diverge in economics.
+                "economics_inputs": ("$ref:Design a strategy candidate.output.economics_inputs"),
+            },
+            depends_on_titles=("Design a strategy candidate", "Build the strategy candidate"),
+            post_checks=(
+                PostCheck("nonempty", {"field": "backtest_id"}),
+                PostCheck("nonempty", {"field": "schema_version"}),
+                PostCheck("nonempty", {"field": "metrics"}),
+                PostCheck(
+                    "range",
+                    {
+                        "field": "approval_rate",
+                        "min": 0.0,
+                        "max": 1.0,
+                        "allow_null": True,
+                    },
+                ),
+                PostCheck(
+                    "range",
+                    {
+                        "field": "approved_bad_rate",
+                        "min": 0.0,
+                        "max": 1.0,
+                        "allow_null": True,
+                    },
+                ),
+                PostCheck(
+                    "range",
+                    {
+                        "field": "rejected_bad_rate",
+                        "min": 0.0,
+                        "max": 1.0,
+                        "allow_null": True,
+                    },
+                ),
+                PostCheck(
+                    "range",
+                    {"field": "expected_profit", "allow_null": True},
+                ),
+            ),
+            decision_point=True,
+        ),
+        StepTemplate(
+            title="Generate the candidate report",
+            tool_ref=ToolRef("strategy", "render_strategy_doc"),
+            inputs_template={
+                "strategy_id": "$ref:Build the strategy candidate.output.strategy_id",
+            },
+            depends_on_titles=("Build the strategy candidate", "Backtest the strategy candidate"),
+            post_checks=(PostCheck("nonempty", {"field": "doc_path"}),),
+        ),
+        StepTemplate(
+            title="Adopt the strategy candidate",
+            tool_ref=ToolRef("strategy", "adopt_strategy"),
+            inputs_template={
+                "strategy_id": "$ref:Build the strategy candidate.output.strategy_id",
+                "backtest_id": "$ref:Backtest the strategy candidate.output.backtest_id",
+                "adoption_reason": "",
+            },
+            depends_on_titles=(
+                "Build the strategy candidate",
+                "Backtest the strategy candidate",
+                "Generate the candidate report",
+            ),
+            post_checks=(PostCheck("nonempty", {"field": "artifacts"}),),
+            # This is the only mandatory human governance decision in the flow.
+            needs_confirmation=True,
+        ),
+        StepTemplate(
+            title="Generate the adopted strategy report",
+            tool_ref=ToolRef("strategy", "render_strategy_doc"),
+            inputs_template={
+                "strategy_id": "$ref:Adopt the strategy candidate.output.strategy_id",
+            },
+            depends_on_titles=("Adopt the strategy candidate",),
+            post_checks=(PostCheck("nonempty", {"field": "doc_path"}),),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+TYPED_STRATEGY_BUILD = WorkflowTemplate(
+    id="typed_strategy_build",
+    title="Build a strategy by type",
+    goal_patterns=("Typed Policy Development", "typed strategy build"),
+    slots=(
+        SlotSpec("strategy_spec", True, "user", "Validated canonical Strategy DSL"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Build the draft strategy",
+            tool_ref=ToolRef("strategy", "build_strategy"),
+            inputs_template={
+                "strategy_spec": "{slot:strategy_spec}",
+                "description": "Natural-language compiled typed strategy",
+            },
+            depends_on_titles=(),
+            post_checks=(PostCheck("nonempty", {"field": "strategy_id"}),),
+        ),
+        StepTemplate(
+            title="Generate the draft strategy report",
+            tool_ref=ToolRef("strategy", "render_strategy_doc"),
+            inputs_template={
+                "strategy_id": "$ref:Build the draft strategy.output.strategy_id",
+            },
+            depends_on_titles=("Build the draft strategy",),
+            post_checks=(PostCheck("nonempty", {"field": "doc_path"}),),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+TYPED_STRATEGY_EVALUATION = WorkflowTemplate(
+    # Natural-language requests compile into a canonical StrategySpec before this
+    # workflow is instantiated. The shared build/backtest/doc chain therefore
+    # evaluates all five strategy types without copying approval-only cutoff or
+    # tradeoff steps into limit, pricing or segmentation flows.
+    id="typed_strategy_evaluation",
+    title="Evaluate a strategy by type",
+    goal_patterns=(
+        "Typed strategy assessment",
+        "typed strategy evaluation",
+    ),
+    slots=(
+        SlotSpec("dataset_id", True, "task_context", "Registered strategy dataset id"),
+        SlotSpec("target_col", True, "task_context", "Binary target column"),
+        _STRATEGY_SAMPLE_DESIGN_REF_SLOT,
+        SlotSpec(
+            "drop_nan_labels", False, "user", "Confirmed target null-row exclusion"
+        ),
+        SlotSpec("strategy_spec", True, "user", "Validated canonical Strategy DSL"),
+        SlotSpec(
+            "baseline_strategy_id", False, "user", "Optional baseline strategy id"
+        ),
+        SlotSpec(
+            "economics_inputs", False, "user", "Typed limit/pricing economics inputs"
+        ),
+        SlotSpec("profit_params", False, "user", "Approval/reject profit parameters"),
+        SlotSpec("ead_col", False, "user", "Approval/reject EAD column"),
+        SlotSpec("pd_col", False, "user", "Approval/reject PD column"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Build the strategy",
+            tool_ref=ToolRef("strategy", "build_strategy"),
+            inputs_template={
+                "strategy_spec": "{slot:strategy_spec}",
+                "description": "Natural-language compiled typed strategy",
+            },
+            depends_on_titles=(),
+            post_checks=(PostCheck("nonempty", {"field": "strategy_id"}),),
+        ),
+        StepTemplate(
+            title="Backtest the strategy",
+            tool_ref=ToolRef("strategy", "backtest_strategy"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "strategy_id": "$ref:Build the strategy.output.strategy_id",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+                "baseline_strategy_id": "{slot:baseline_strategy_id}",
+                "economics_inputs": "{slot:economics_inputs}",
+                "profit_params": "{slot:profit_params}",
+                "ead_col": "{slot:ead_col}",
+                "pd_col": "{slot:pd_col}",
+            },
+            depends_on_titles=("Build the strategy",),
+            post_checks=(
+                PostCheck("nonempty", {"field": "backtest_id"}),
+                PostCheck("nonempty", {"field": "schema_version"}),
+                PostCheck("nonempty", {"field": "metrics"}),
+                # The shared Tool retains flat approval aliases only for
+                # approval/reject compatibility. Missing aliases on the other
+                # three typed envelopes are valid, hence ``allow_null``.
+                PostCheck(
+                    "range",
+                    {
+                        "field": "approval_rate",
+                        "min": 0.0,
+                        "max": 1.0,
+                        "allow_null": True,
+                    },
+                ),
+                PostCheck(
+                    "range",
+                    {
+                        "field": "approved_bad_rate",
+                        "min": 0.0,
+                        "max": 1.0,
+                        "allow_null": True,
+                    },
+                ),
+                PostCheck(
+                    "range",
+                    {
+                        "field": "rejected_bad_rate",
+                        "min": 0.0,
+                        "max": 1.0,
+                        "allow_null": True,
+                    },
+                ),
+                PostCheck("range", {"field": "expected_profit", "allow_null": True}),
+            ),
+            decision_point=True,
+        ),
+        StepTemplate(
+            title="Generate the strategy report",
+            tool_ref=ToolRef("strategy", "render_strategy_doc"),
+            inputs_template={
+                "strategy_id": "$ref:Build the strategy.output.strategy_id",
+            },
+            depends_on_titles=("Build the strategy", "Backtest the strategy"),
+            post_checks=(PostCheck("nonempty", {"field": "doc_path"}),),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+TYPED_STRATEGY_APPLY = WorkflowTemplate(
+    id="typed_strategy_apply",
+    title="Build and apply a strategy",
+    goal_patterns=("Construct and apply policies", "build and apply typed strategy"),
+    slots=(
+        SlotSpec("dataset_id", True, "task_context", "Task-owned input dataset id"),
+        SlotSpec("strategy_spec", True, "user", "Validated canonical Strategy DSL"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Build the strategy to apply",
+            tool_ref=ToolRef("strategy", "build_strategy"),
+            inputs_template={
+                "strategy_spec": "{slot:strategy_spec}",
+                "description": "Natural-language compiled strategy for application",
+            },
+            depends_on_titles=(),
+            post_checks=(PostCheck("nonempty", {"field": "strategy_id"}),),
+        ),
+        StepTemplate(
+            title="Apply the strategy and generate row-level results",
+            tool_ref=ToolRef("strategy", "apply_strategy"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "strategy_id": "$ref:Build the strategy to apply.output.strategy_id",
+            },
+            depends_on_titles=("Build the strategy to apply",),
+            post_checks=(
+                PostCheck("nonempty", {"field": "schema_version"}),
+                PostCheck("nonempty", {"field": "result_dataset_id"}),
+                PostCheck("range", {"field": "population_count", "min": 0}),
+                PostCheck("nonempty", {"field": "evidence"}),
+            ),
+        ),
+        StepTemplate(
+            title="Generate the application report",
+            tool_ref=ToolRef("strategy", "render_strategy_doc"),
+            inputs_template={
+                "strategy_id": "$ref:Build the strategy to apply.output.strategy_id",
+            },
+            depends_on_titles=("Build the strategy to apply", "Apply the strategy and generate row-level results"),
+            post_checks=(PostCheck("nonempty", {"field": "doc_path"}),),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STORED_STRATEGY_EVALUATION = WorkflowTemplate(
+    id="stored_strategy_evaluation",
+    title="Evaluate an existing strategy",
+    goal_patterns=(
+        "Recovering existing strategies",
+        "Analyse existing strategies",
+        "Compare existing strategies",
+        "stored strategy evaluation",
+    ),
+    slots=(
+        SlotSpec("dataset_id", True, "task_context", "Registered strategy dataset id"),
+        SlotSpec("target_col", True, "task_context", "Binary target column"),
+        _STRATEGY_SAMPLE_DESIGN_REF_SLOT,
+        SlotSpec(
+            "drop_nan_labels", False, "user", "Confirmed target null-row exclusion"
+        ),
+        SlotSpec("strategy_id", True, "user", "Task-owned strategy id"),
+        SlotSpec(
+            "baseline_strategy_id", False, "user", "Optional same-type baseline id"
+        ),
+        SlotSpec(
+            "economics_inputs", False, "user", "Typed limit/pricing economics inputs"
+        ),
+        SlotSpec("profit_params", False, "user", "Approval/reject profit parameters"),
+        SlotSpec("ead_col", False, "user", "Approval/reject EAD column"),
+        SlotSpec("pd_col", False, "user", "Approval/reject PD column"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Backtest the existing strategy",
+            tool_ref=ToolRef("strategy", "backtest_strategy"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "strategy_id": "{slot:strategy_id}",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+                "baseline_strategy_id": "{slot:baseline_strategy_id}",
+                "economics_inputs": "{slot:economics_inputs}",
+                "profit_params": "{slot:profit_params}",
+                "ead_col": "{slot:ead_col}",
+                "pd_col": "{slot:pd_col}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "backtest_id"}),
+                PostCheck("nonempty", {"field": "schema_version"}),
+                PostCheck("nonempty", {"field": "metrics"}),
+                PostCheck(
+                    "range",
+                    {
+                        "field": "approval_rate",
+                        "min": 0.0,
+                        "max": 1.0,
+                        "allow_null": True,
+                    },
+                ),
+                PostCheck(
+                    "range",
+                    {
+                        "field": "approved_bad_rate",
+                        "min": 0.0,
+                        "max": 1.0,
+                        "allow_null": True,
+                    },
+                ),
+                PostCheck(
+                    "range",
+                    {
+                        "field": "rejected_bad_rate",
+                        "min": 0.0,
+                        "max": 1.0,
+                        "allow_null": True,
+                    },
+                ),
+                PostCheck("range", {"field": "expected_profit", "allow_null": True}),
+            ),
+            decision_point=True,
+        ),
+        StepTemplate(
+            title="Generate the strategy evaluation report",
+            tool_ref=ToolRef("strategy", "render_strategy_doc"),
+            inputs_template={"strategy_id": "{slot:strategy_id}"},
+            depends_on_titles=("Backtest the existing strategy",),
+            post_checks=(PostCheck("nonempty", {"field": "doc_path"}),),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STORED_STRATEGY_REPORT = WorkflowTemplate(
+    id="stored_strategy_report",
+    title="Report on an existing strategy",
+    goal_patterns=("Generate an existing strategy report", "stored strategy report"),
+    slots=(SlotSpec("strategy_id", True, "user", "Task-owned strategy id"),),
+    steps=(
+        StepTemplate(
+            title="Generate the strategy report",
+            tool_ref=ToolRef("strategy", "render_strategy_doc"),
+            inputs_template={"strategy_id": "{slot:strategy_id}"},
+            depends_on_titles=(),
+            post_checks=(PostCheck("nonempty", {"field": "doc_path"}),),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STORED_STRATEGY_APPLY = WorkflowTemplate(
+    id="stored_strategy_apply",
+    title="Apply an existing strategy",
+    goal_patterns=("Apply an existing policy", "Implement Existing Strategies", "apply stored strategy"),
+    slots=(
+        SlotSpec("dataset_id", True, "task_context", "Task-owned input dataset id"),
+        SlotSpec("strategy_id", True, "user", "Task-owned persisted strategy id"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Apply the strategy and generate row-level results",
+            tool_ref=ToolRef("strategy", "apply_strategy"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "strategy_id": "{slot:strategy_id}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "schema_version"}),
+                PostCheck("nonempty", {"field": "result_dataset_id"}),
+                PostCheck("range", {"field": "population_count", "min": 0}),
+                PostCheck("nonempty", {"field": "output_columns"}),
+                PostCheck("nonempty", {"field": "evidence"}),
+            ),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STORED_STRATEGY_ADOPTION = WorkflowTemplate(
+    id="stored_strategy_adoption",
+    title="Adopt an existing strategy",
+    goal_patterns=("Adopt existing strategies", "adopt stored strategy"),
+    slots=(
+        SlotSpec("dataset_id", True, "task_context", "Registered strategy dataset id"),
+        SlotSpec("target_col", True, "task_context", "Binary target column"),
+        _STRATEGY_SAMPLE_DESIGN_REF_SLOT,
+        SlotSpec(
+            "drop_nan_labels", False, "user", "Confirmed target null-row exclusion"
+        ),
+        SlotSpec("strategy_id", True, "user", "Task-owned draft strategy id"),
+        SlotSpec("adoption_reason", True, "user", "Human supplied adoption reason"),
+        SlotSpec(
+            "economics_inputs", False, "user", "Typed limit/pricing economics inputs"
+        ),
+        SlotSpec("profit_params", False, "user", "Approval/reject profit parameters"),
+        SlotSpec("ead_col", False, "user", "Approval/reject EAD column"),
+        SlotSpec("pd_col", False, "user", "Approval/reject PD column"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Backtest before adoption",
+            tool_ref=ToolRef("strategy", "backtest_strategy"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "strategy_id": "{slot:strategy_id}",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+                "economics_inputs": "{slot:economics_inputs}",
+                "profit_params": "{slot:profit_params}",
+                "ead_col": "{slot:ead_col}",
+                "pd_col": "{slot:pd_col}",
+            },
+            depends_on_titles=(),
+            post_checks=(
+                PostCheck("nonempty", {"field": "backtest_id"}),
+                PostCheck("nonempty", {"field": "schema_version"}),
+                PostCheck("nonempty", {"field": "metrics"}),
+                PostCheck(
+                    "range",
+                    {
+                        "field": "approval_rate",
+                        "min": 0.0,
+                        "max": 1.0,
+                        "allow_null": True,
+                    },
+                ),
+                PostCheck(
+                    "range",
+                    {
+                        "field": "approved_bad_rate",
+                        "min": 0.0,
+                        "max": 1.0,
+                        "allow_null": True,
+                    },
+                ),
+                PostCheck(
+                    "range",
+                    {
+                        "field": "rejected_bad_rate",
+                        "min": 0.0,
+                        "max": 1.0,
+                        "allow_null": True,
+                    },
+                ),
+                PostCheck("range", {"field": "expected_profit", "allow_null": True}),
+            ),
+            decision_point=True,
+        ),
+        StepTemplate(
+            title="Adopt the strategy",
+            tool_ref=ToolRef("strategy", "adopt_strategy"),
+            inputs_template={
+                "strategy_id": "{slot:strategy_id}",
+                "backtest_id": "$ref:Backtest before adoption.output.backtest_id",
+                "adoption_reason": "{slot:adoption_reason}",
+            },
+            depends_on_titles=("Backtest before adoption",),
+            post_checks=(PostCheck("nonempty", {"field": "artifacts"}),),
+            needs_confirmation=True,
+        ),
+        StepTemplate(
+            title="Generate the adopted strategy report",
+            tool_ref=ToolRef("strategy", "render_strategy_doc"),
+            inputs_template={"strategy_id": "{slot:strategy_id}"},
+            depends_on_titles=("Adopt the strategy",),
+            post_checks=(PostCheck("nonempty", {"field": "doc_path"}),),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+VINTAGE_ANALYSIS = WorkflowTemplate(
+    id="vintage_analysis",
+    title="Vintage risk analysis",
+    goal_patterns=("Risk analysis", "vintage", "vintage analysis", "Ageing"),
+    slots=(
+        SlotSpec("dataset_id", True, "task_context", "Registered vintage dataset id"),
+        SlotSpec("cohort_col", True, "task_context", "Cohort/month column"),
+        SlotSpec("mob_col", True, "task_context", "Month-on-book column"),
+        SlotSpec("bad_col", True, "task_context", "Binary bad/default target column"),
+        SlotSpec("mob_max", False, "task_context", "Maximum MOB to render"),
+        SlotSpec("ref_mob", False, "task_context", "Reference MOB for trend summary"),
+        # A1: label_semantics has no default slot value on purpose -- an undeclared
+        # basis makes tool_vintage_curve raise LabelSemanticsNotDeclaredError so the
+        # user is forced to pick incremental vs snapshot; drop_nan_labels threads the
+        # NaN-label confirmation through the same gate.
+        SlotSpec(
+            "label_semantics",
+            False,
+            "user",
+            "Bad-column cumulation basis: incremental or snapshot",
+            default=None,
+        ),
+        SlotSpec("drop_nan_labels", False, "user", "Confirm dropping NaN-label rows"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Calculate vintage curves",
+            tool_ref=ToolRef("strategy", "vintage_curve"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "cohort_col": "{slot:cohort_col}",
+                "mob_col": "{slot:mob_col}",
+                "bad_col": "{slot:bad_col}",
+                "mob_max": "{slot:mob_max}",
+                "ref_mob": "{slot:ref_mob}",
+                # SlotSpec supplies a literal-null default so the adjust gate can
+                # still write a choice when intake has no answer.  A declared
+                # conversational value now reaches the tool instead of being
+                # overwritten by that default.
+                "label_semantics": "{slot:label_semantics}",
+                # Baked False (a valid boolean per the manifest) for the same reason,
+                # so a "drop the NaN rows" confirmation can be written onto the step.
+                "drop_nan_labels": False,
+            },
+            depends_on_titles=(),
+            post_checks=(PostCheck("nonempty", {"field": "cohorts"}),),
+            # Standard Vintage is a complete, deterministic one-step delivery.
+            # Leaving it as a decision point lets the generic LLM replan append
+            # an unrelated terminal step, and the completion composer then
+            # renders that step instead of the already-computed curve tables.
+            decision_point=False,
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+RISK_ANALYSIS_REPORT = WorkflowTemplate(
+    id="risk_analysis_report",
+    title="Risk and profitability report",
+    goal_patterns=("VTGEnd value", "Unenviable age", "Proceeds measure", "risk analysis report"),
+    slots=(
+        SlotSpec("analysis_kind", True, "task_context", "vtg_terminal or profitability"),
+        SlotSpec("dataset_id", True, "task_context", "Registered canonical input dataset"),
+        SlotSpec("column_map", True, "task_context", "Canonical-to-source column mapping"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Generate risk analysis report",
+            tool_ref=ToolRef("risk_analysis", "generate_risk_analysis_report"),
+            inputs_template={
+                "analysis_kind": "{slot:analysis_kind}",
+                "dataset_id": "{slot:dataset_id}",
+                "column_map": "{slot:column_map}",
+            },
+            depends_on_titles=(),
+            post_checks=(PostCheck("nonempty", {"field": "report_path"}),),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+SLICE_AGGREGATE = WorkflowTemplate(
+    # S6 ad-hoc Question Numberentry: a single deterministic group-by aggregate over a
+    # ready dataset. The LLM only produced a validated SliceSpec (INV-1); the
+    # Validation door.is handled turn-side (turn_handlers) BEFORE this plan is built,
+    # so — like vintage_analysis — the one step just runs to DONE and renders its
+    # table (no needs_confirmation gate). Every slice_aggregate input is an
+    # optional slot; turn_handlers fills exactly SliceSpec.tool_inputs(dataset_id),
+    # and omitted slots drop out via _fill_inputs' _OMIT handling.
+    id="slice_aggregate",
+    title="Aggregate data by group",
+    goal_patterns=("Question Number", "Summary analysis", "slice aggregate", "ad-hoc query"),
+    slots=(
+        SlotSpec("dataset_id", True, "task_context", "Ready dataset id to aggregate"),
+        SlotSpec(
+            "expected_content_hash",
+            True,
+            "task_context",
+            "Confirmed SHA-256 identity of the ready dataset",
+        ),
+        SlotSpec(
+            "metrics", True, "task_context", "Validated aggregate metrics (op/col)"
+        ),
+        SlotSpec("group_by", False, "task_context", "Optional group-by columns"),
+        SlotSpec("filters", False, "task_context", "Optional filter conditions"),
+        SlotSpec("month_col", False, "task_context", "Optional month column"),
+        SlotSpec("months", False, "task_context", "Optional month range"),
+        SlotSpec("sort_by", False, "task_context", "Optional sort column/metric label"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Calculate grouped results",
+            tool_ref=ToolRef("data_ops", "slice_aggregate"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "expected_content_hash": "{slot:expected_content_hash}",
+                "metrics": "{slot:metrics}",
+                "group_by": "{slot:group_by}",
+                "filters": "{slot:filters}",
+                "month_col": "{slot:month_col}",
+                "months": "{slot:months}",
+                "sort_by": "{slot:sort_by}",
+            },
+            depends_on_titles=(),
+            post_checks=(PostCheck("nonempty", {"field": "columns"}),),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+STRATEGY_DEVELOPMENT = WorkflowTemplate(
+    # S2 conversational strategy-development template. It is the standard entry;
+    # strategy_analysis remains only as an explicit quick-analysis compatibility path.
+    # Flow: tradeoff scan (direction self-check) -> design cutoff bands -> build
+    # strategy from the recommended rules -> backtest -> [optional] compare vs
+    # baseline -> [mandatory confirm] adopt -> render doc. goal_patterns are disjoint from
+    # strategy_analysis so keyword routing never crosses the two.
+    id="strategy_development",
+    title="Strategy development",
+    goal_patterns=(
+        "Policy development",
+        "Development Policy",
+        "Policy analysis",
+        "Policy Reaction",
+        "Policy trade-offs",
+        "Designcutoff",
+        "Scores and Crafts",
+        "strategy development",
+        "strategy analysis",
+        "strategy backtest",
+    ),
+    slots=(
+        SlotSpec("dataset_id", True, "task_context", "Registered strategy dataset id"),
+        SlotSpec("target_col", True, "task_context", "Binary target column"),
+        _STRATEGY_SAMPLE_DESIGN_REF_SLOT,
+        SlotSpec(
+            "drop_nan_labels", False, "user", "Confirmed target null-row exclusion"
+        ),
+        SlotSpec("score_col", True, "task_context", "Score column"),
+        SlotSpec(
+            "score_direction",
+            False,
+            "task_context",
+            "Score direction if a model artifact injected one",
+        ),
+        SlotSpec("objective", False, "user", "max_profit or max_approval"),
+        SlotSpec("max_bad_rate", False, "user", "Max approved bad rate constraint"),
+        SlotSpec("min_approval_rate", False, "user", "Min approval rate constraint"),
+        SlotSpec(
+            "ead_col", False, "user", "Exposure-at-default column for profit evaluation"
+        ),
+        SlotSpec(
+            "pd_col",
+            False,
+            "user",
+            "Probability-of-default column for profit evaluation",
+        ),
+        SlotSpec(
+            "profit_params", False, "user", "Profit parameters for expected-profit"
+        ),
+        SlotSpec(
+            "strategy_type", True, "task_context", "Approval or reject strategy type"
+        ),
+        SlotSpec(
+            "baseline_strategy_id",
+            False,
+            "user",
+            "Baseline strategy id for the optional compare step",
+        ),
+    ),
+    steps=(
+        StepTemplate(
+            title="Compare score trade-offs",
+            tool_ref=ToolRef("strategy", "tradeoff_view"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "score_col": "{slot:score_col}",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+                "score_direction": "{slot:score_direction}",
+                "objective": "{slot:objective}",
+                "max_bad_rate": "{slot:max_bad_rate}",
+                "min_approval_rate": "{slot:min_approval_rate}",
+                "ead_col": "{slot:ead_col}",
+                "pd_col": "{slot:pd_col}",
+                "profit_params": "{slot:profit_params}",
+            },
+            depends_on_titles=(),
+            post_checks=(PostCheck("nonempty", {"field": "points"}),),
+            decision_point=True,
+        ),
+        StepTemplate(
+            title="Design score bands",
+            tool_ref=ToolRef("strategy", "design_cutoff_bands"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "score_col": "{slot:score_col}",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+                "score_direction": "{slot:score_direction}",
+                "objective": "{slot:objective}",
+                "max_bad_rate": "{slot:max_bad_rate}",
+                "min_approval_rate": "{slot:min_approval_rate}",
+                "ead_col": "{slot:ead_col}",
+                "pd_col": "{slot:pd_col}",
+                "profit_params": "{slot:profit_params}",
+                # Keep an explicit null key so a validated structured adjustment
+                # can supply manual edges before execution. Omitted optional slot
+                # keys are otherwise removed by planner._fill_inputs.
+                "band_edges": None,
+            },
+            depends_on_titles=("Compare score trade-offs",),
+            post_checks=(PostCheck("nonempty", {"field": "bands"}),),
+        ),
+        StepTemplate(
+            title="Build strategy",
+            tool_ref=ToolRef("strategy", "build_strategy"),
+            inputs_template={
+                "strategy_type": "{slot:strategy_type}",
+                "rules": "$ref:Design score bands.output.recommended_rules",
+                "score_col": "{slot:score_col}",
+                "default_decision": "approve",
+                "description": "Strategy development generated candidate",
+            },
+            depends_on_titles=("Design score bands",),
+            post_checks=(PostCheck("nonempty", {"field": "strategy_id"}),),
+        ),
+        StepTemplate(
+            title="Backtest strategy",
+            tool_ref=ToolRef("strategy", "backtest_strategy"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "strategy_id": "$ref:Build strategy.output.strategy_id",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+                "baseline_strategy_id": "{slot:baseline_strategy_id}",
+                "ead_col": "{slot:ead_col}",
+                "pd_col": "{slot:pd_col}",
+                "profit_params": "{slot:profit_params}",
+            },
+            depends_on_titles=("Build strategy",),
+            post_checks=(
+                PostCheck("nonempty", {"field": "backtest_id"}),
+                PostCheck("range", {"field": "approval_rate", "min": 0.0, "max": 1.0}),
+                PostCheck(
+                    "range", {"field": "approved_bad_rate", "min": 0.0, "max": 1.0}
+                ),
+                PostCheck(
+                    "range", {"field": "rejected_bad_rate", "min": 0.0, "max": 1.0}
+                ),
+                PostCheck(
+                    "range", {"field": "expected_profit", "allow_null": True}
+                ),  # FIN-3 #4: None when profit requested w/o pd_col (graceful EL degradation)
+            ),
+            decision_point=True,
+        ),
+        StepTemplate(
+            title="Compare with the baseline",
+            tool_ref=ToolRef("strategy", "compare_strategies"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+                "strategy_id": "$ref:Build strategy.output.strategy_id",
+                "baseline_strategy_id": "{slot:baseline_strategy_id}",
+                "ead_col": "{slot:ead_col}",
+                "pd_col": "{slot:pd_col}",
+                "profit_params": "{slot:profit_params}",
+            },
+            depends_on_titles=("Build strategy", "Backtest strategy"),
+            post_checks=(PostCheck("nonempty", {"field": "status"}),),
+            decision_point=True,
+        ),
+        StepTemplate(
+            # S6: optional challenger report step, sits right after the compare step.
+            # planner has no step-pruning, so degradation is at the TOOL level: with no
+            # champion (baseline_strategy_id slot omitted) render_challenger_report
+            # returns status='no_baseline' + a [No baseline provided)markdown and writes NO
+            # artifact -- exactly the compare_strategies no-op precedent, so the step
+            # never fails the plan. The renderer accepts only the persisted challenger
+            # backtest receipt; it reloads and recomputes task-owned champion/challenger
+            # evidence instead of trusting caller-supplied metrics or adoption flags.
+            title="Generate challenger report",
+            tool_ref=ToolRef("strategy", "render_challenger_report"),
+            inputs_template={
+                "strategy_id": "$ref:Build strategy.output.strategy_id",
+                "champion_strategy_id": "{slot:baseline_strategy_id}",
+                "challenger_backtest": "$ref:Backtest strategy.output",
+            },
+            depends_on_titles=("Build strategy", "Compare with the baseline", "Backtest strategy"),
+            post_checks=(PostCheck("nonempty", {"field": "status"}),),
+        ),
+        StepTemplate(
+            title="Adopt the strategy",
+            tool_ref=ToolRef("strategy", "adopt_strategy"),
+            inputs_template={
+                "strategy_id": "$ref:Build strategy.output.strategy_id",
+                "backtest_id": "$ref:Backtest strategy.output.backtest_id",
+                # The evidence-bound final gate writes the operator's reason into this
+                # explicit override target.  Task setup must never pre-authorize adoption.
+                "adoption_reason": "",
+                "band_stats": "$ref:Design score bands.output",
+            },
+            depends_on_titles=("Design score bands", "Build strategy", "Backtest strategy"),
+            post_checks=(PostCheck("nonempty", {"field": "artifacts"}),),
+            # Mandatory adoption gate: auto-accept must not pass it through
+            # (delivery-gate precedent), so the driver always pauses here.
+            needs_confirmation=True,
+        ),
+        StepTemplate(
+            title="Generate strategy report",
+            tool_ref=ToolRef("strategy", "render_strategy_doc"),
+            inputs_template={
+                "strategy_id": "$ref:Build strategy.output.strategy_id",
+                "band_stats": "$ref:Design score bands.output",
+            },
+            depends_on_titles=("Design score bands", "Build strategy", "Adopt the strategy"),
+            post_checks=(PostCheck("nonempty", {"field": "doc_path"}),),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
+
+
+RULE_STRATEGY = WorkflowTemplate(
+    # S4 conversational rule-mining strategy template (new id; disjoint
+    # goal_patterns from strategy_analysis/strategy_development so keyword routing
+    # never crosses them). Flow: mine candidate reject rules -> select an ordered
+    # subset -> evaluate the chosen set (waterfall/overlap) -> build a reject
+    # strategy from the selected rules -> backtest -> [mandatory confirm] adopt
+    # (S2 forced gate reused) -> render doc. Adoption/doc/memory reuse S2 unchanged.
+    id="rule_strategy",
+    title="Rule-based strategy development",
+    goal_patterns=("Rule dig", "Rule of Refuse", "Rule Policy", "rule mining", "rule strategy"),
+    slots=(
+        SlotSpec("dataset_id", True, "task_context", "Registered strategy dataset id"),
+        SlotSpec("target_col", True, "task_context", "Binary target column"),
+        _STRATEGY_SAMPLE_DESIGN_REF_SLOT,
+        SlotSpec(
+            "drop_nan_labels", False, "user", "Confirmed target null-row exclusion"
+        ),
+        SlotSpec(
+            "feature_cols",
+            False,
+            "user",
+            "Candidate feature columns (default: numeric columns)",
+        ),
+        SlotSpec(
+            "score_col",
+            False,
+            "user",
+            "Score column, if the rules should carry score-band rules",
+        ),
+        SlotSpec("max_depth", False, "user", "Decision-tree depth for rule mining"),
+        SlotSpec("min_support", False, "user", "Minimum rule support"),
+        SlotSpec("min_lift", False, "user", "Minimum rule lift"),
+        SlotSpec("top_k", False, "user", "Maximum candidate rules to return"),
+    ),
+    steps=(
+        StepTemplate(
+            title="Discover rules",
+            tool_ref=ToolRef("strategy", "mine_rules"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+                "feature_cols": "{slot:feature_cols}",
+                "max_depth": "{slot:max_depth}",
+                "min_support": "{slot:min_support}",
+                "min_lift": "{slot:min_lift}",
+                "top_k": "{slot:top_k}",
+            },
+            depends_on_titles=(),
+            post_checks=(PostCheck("nonempty", {"field": "candidate_rules"}),),
+        ),
+        StepTemplate(
+            title="Select a rule set",
+            tool_ref=ToolRef("strategy", "select_rule_set"),
+            inputs_template={
+                "candidate_rules": "$ref:Discover rules.output.candidate_rules",
+                # None deterministically keeps all mined candidates. A structured
+                # request compiler may supply an explicit subset before plan run;
+                # selection itself is reversible and is not a governance gate.
+                "selection": None,
+            },
+            depends_on_titles=("Discover rules",),
+            post_checks=(PostCheck("nonempty", {"field": "selected_rules"}),),
+        ),
+        StepTemplate(
+            title="Evaluate the rule set",
+            tool_ref=ToolRef("strategy", "evaluate_rule_set"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+                "rules": "$ref:Select a rule set.output.selected_rules",
+            },
+            depends_on_titles=("Select a rule set",),
+            post_checks=(PostCheck("nonempty", {"field": "waterfall"}),),
+            decision_point=True,
+        ),
+        StepTemplate(
+            title="Build strategy",
+            tool_ref=ToolRef("strategy", "build_strategy"),
+            inputs_template={
+                # Pin the literal reject-strategy defaults (SlotSpec has no
+                # default-value mechanism): a rule strategy is an approval-type
+                # strategy whose selected rules reject, defaulting to approve.
+                "strategy_type": "approval",
+                "rules": "$ref:Select a rule set.output.selected_rules",
+                # score_col flows only when the optional slot is filled; when a
+                # score column is present build_strategy's rule-direction
+                # self-check (S1a) fires automatically on any score-band rules.
+                "score_col": "{slot:score_col}",
+                "default_decision": "approve",
+                "description": "Rule strategy generated candidate",
+            },
+            depends_on_titles=("Select a rule set",),
+            post_checks=(PostCheck("nonempty", {"field": "strategy_id"}),),
+        ),
+        StepTemplate(
+            title="Backtest strategy",
+            tool_ref=ToolRef("strategy", "backtest_strategy"),
+            inputs_template={
+                "dataset_id": "{slot:dataset_id}",
+                "strategy_id": "$ref:Build strategy.output.strategy_id",
+                "target_col": "{slot:target_col}",
+                "sample_design_ref": "{slot:sample_design_ref}",
+                "drop_nan_labels": "{slot:drop_nan_labels}",
+            },
+            depends_on_titles=("Build strategy",),
+            post_checks=(
+                PostCheck("nonempty", {"field": "backtest_id"}),
+                PostCheck("range", {"field": "approval_rate", "min": 0.0, "max": 1.0}),
+                PostCheck(
+                    "range", {"field": "approved_bad_rate", "min": 0.0, "max": 1.0}
+                ),
+                PostCheck(
+                    "range", {"field": "rejected_bad_rate", "min": 0.0, "max": 1.0}
+                ),
+                PostCheck(
+                    "range", {"field": "expected_profit", "allow_null": True}
+                ),  # FIN-3 #4: None when profit requested w/o pd_col (graceful EL degradation)
+            ),
+            decision_point=True,
+        ),
+        StepTemplate(
+            title="Adopt the strategy",
+            tool_ref=ToolRef("strategy", "adopt_strategy"),
+            inputs_template={
+                "strategy_id": "$ref:Build strategy.output.strategy_id",
+                "backtest_id": "$ref:Backtest strategy.output.backtest_id",
+                "adoption_reason": "",
+            },
+            depends_on_titles=("Build strategy", "Backtest strategy"),
+            post_checks=(PostCheck("nonempty", {"field": "artifacts"}),),
+            # Mandatory adoption gate (S2 forced-gate precedent): auto-accept must
+            # not pass it through, so the driver always pauses here.
+            needs_confirmation=True,
+        ),
+        StepTemplate(
+            title="Generate strategy report",
+            tool_ref=ToolRef("strategy", "render_strategy_doc"),
+            inputs_template={
+                "strategy_id": "$ref:Build strategy.output.strategy_id",
+            },
+            depends_on_titles=("Build strategy", "Adopt the strategy"),
+            post_checks=(PostCheck("nonempty", {"field": "doc_path"}),),
+        ),
+    ),
+    default_autonomy=1,
+    source="builtin",
+)
