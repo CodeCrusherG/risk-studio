@@ -1,0 +1,915 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+import json
+
+from marvis.agent.service import (
+    REQUIRED_AGENT_REPORT_KEYS,
+    agent_conclusions_confirmed,
+    latest_report_draft_context,
+)
+from marvis.agent.validation_messages import (
+    add_and_stream_agent_message,
+    agent_stage_label,
+    agent_stage_opening_text,
+    format_conclusion_values,
+    model_metadata,
+    stream_agent_message,
+)
+from marvis.agent.validation_service import raise_if_agent_cancelled
+from marvis.agent_memory.api_support import (
+    agent_memory_context_from_store,
+    audit_agent_memory_use_from_store,
+)
+from marvis.agent_memory.store import AgentMemoryStore
+from marvis.domain import TASK_TYPE_VALIDATION, TaskRecord, TaskStatus
+from marvis.repositories.tasks import AGENT_REPORT_WRITABLE_KEYS, TaskRepository
+from marvis.repositories.validation_contracts import (
+    ValidationContractRepository,
+    require_confirmed_validation_input_contract,
+)
+from marvis.validation.suggested_confirmation import confirm_unambiguous_contract
+
+
+MAX_INPUT_CONFIRMATION_CANDIDATE_LINES = 24
+MAX_INPUT_CONFIRMATION_CANDIDATES_PER_FIELD = 3
+MAX_INPUT_CONFIRMATION_VALUE_CHARS = 160
+
+
+def _require_ready_contract_for_v2(
+    settings,
+    task: TaskRecord,
+) -> None:
+    if (
+        task.task_type == TASK_TYPE_VALIDATION
+        and task.validation_workflow_version == 2
+    ):
+        require_confirmed_validation_input_contract(
+            ValidationContractRepository(settings.db_path),
+            task.id,
+        )
+
+
+@dataclass(frozen=True)
+class ValidationStageDependencies:
+    perform_scan_task: Callable
+    run_notebook_stage: Callable
+    run_pmml_scoring_stage: Callable
+    run_metrics_stage: Callable
+    run_report_stage: Callable
+    agent_pipeline_settings: Callable
+    agent_evidence_from_settings: Callable
+    add_agent_report_ready_message: Callable
+    is_metrics_failure: Callable[[TaskRecord], bool]
+    compose_agent_start_message: Callable
+    summarize_stage: Callable
+    generate_word_conclusions: Callable
+    fallback_word_conclusions: Callable
+    failure_summary: Callable
+    sync_agent_batch_after_child_report: Callable | None = None
+    sync_agent_batch_child_progress: Callable | None = None
+
+
+def open_agent_stage(
+    repo: TaskRepository,
+    *,
+    task: TaskRecord,
+    task_id: str,
+    stage: str,
+    model_profile: dict,
+    opening_message_id: str | None,
+    auto_accept: bool = False,
+    deps: ValidationStageDependencies,
+) -> None:
+    if deps.sync_agent_batch_child_progress is not None:
+        deps.sync_agent_batch_child_progress(
+            db_path=repo.db_path,
+            child_task_id=task_id,
+            status="running",
+            stage=stage,
+        )
+    if auto_accept and stage != "scan":
+        add_agent_auto_stage_start_message(
+            repo,
+            task_id=task_id,
+            stage=stage,
+            model_profile=model_profile,
+            validation_workflow_version=task.validation_workflow_version,
+        )
+    if stage == "scan":
+        if opening_message_id:
+            stream_agent_message(
+                repo,
+                opening_message_id,
+                task_id=task_id,
+                model_profile=model_profile,
+                producer=lambda on_delta: deps.compose_agent_start_message(
+                    task=task,
+                    model_profile=model_profile,
+                    on_delta=on_delta,
+                ),
+                raise_if_cancelled=raise_if_agent_cancelled,
+            )
+            return
+        add_and_stream_agent_message(
+            repo,
+            task_id,
+            stage="chat",
+            model_profile=model_profile,
+            producer=lambda on_delta: deps.compose_agent_start_message(
+                task=task,
+                model_profile=model_profile,
+                on_delta=on_delta,
+            ),
+            raise_if_cancelled=raise_if_agent_cancelled,
+        )
+        return
+    if auto_accept:
+        return
+    if stage == "word_conclusion_draft":
+        return
+    finalize_agent_opening_message(
+        repo,
+        task_id=task_id,
+        message_id=opening_message_id,
+        model_profile=model_profile,
+        content=agent_stage_opening_text(
+            stage,
+            validation_workflow_version=task.validation_workflow_version,
+        ),
+    )
+
+
+def add_agent_auto_stage_start_message(
+    repo: TaskRepository,
+    *,
+    task_id: str,
+    stage: str,
+    model_profile: dict,
+    validation_workflow_version: int | None = None,
+) -> None:
+    repo.add_agent_message(
+        task_id,
+        role="assistant",
+        stage="chat",
+        content=(
+            "And then we'll start."
+            f"{agent_stage_label(stage, validation_workflow_version=validation_workflow_version)}."
+        ),
+        metadata={
+            **model_metadata(model_profile),
+            "auto_accept": True,
+            "auto_stage_start": stage,
+            "streaming": False,
+        },
+    )
+
+
+def finalize_agent_opening_message(
+    repo: TaskRepository,
+    *,
+    task_id: str,
+    message_id: str | None,
+    model_profile: dict,
+    content: str,
+) -> None:
+    metadata = {**model_metadata(model_profile), "streaming": False}
+    if message_id:
+        repo.update_agent_message(message_id, content=content, metadata=metadata)
+        return
+    repo.add_agent_message(
+        task_id,
+        role="assistant",
+        stage="chat",
+        content=content,
+        metadata=metadata,
+    )
+
+
+def run_agent_scan_stage(
+    repo: TaskRepository,
+    settings,
+    task_id: str,
+    model_profile: dict,
+    *,
+    auto_accept: bool = False,
+    deps: ValidationStageDependencies,
+) -> bool:
+    task = repo.get_task(task_id)
+    repo.add_agent_message(
+        task_id,
+        role="assistant",
+        stage="scan",
+        content=(
+            "Calling for a material identification toolscan_materials:Read the catalogue of materials, identify themNotebook,Sample data,"
+            "PMML Models and data dictionary, and checkNotebook RMC Contract."
+        ),
+        metadata={
+            **model_metadata(model_profile),
+            "tool_call": {
+                "name": "scan_materials",
+                "stage": "scan",
+            },
+        },
+    )
+    raise_if_agent_cancelled(task_id)
+    scan_payload = deps.perform_scan_task(repo, task, settings)
+    raise_if_agent_cancelled(task_id)
+    task = repo.get_task(task_id)
+    if task.status == TaskStatus.FAILED:
+        add_agent_failure_summary(
+            repo,
+            task_id=task_id,
+            task=task,
+            stage_label="Material completeness",
+            error=task.status_message,
+            model_profile=model_profile,
+            deps=deps,
+            evidence={"scan": scan_payload},
+        )
+        return False
+    add_and_stream_agent_message(
+        repo,
+        task_id,
+        stage="scan",
+        model_profile=model_profile,
+        producer=lambda on_delta: deps.summarize_stage(
+            task=task,
+            stage="scan",
+            evidence=scan_payload,
+            model_profile=model_profile,
+            fallback="Material scanning is complete and the Platform has identified the required materials for validation.",
+            on_delta=on_delta,
+        ),
+        raise_if_cancelled=raise_if_agent_cancelled,
+    )
+    raise_if_agent_cancelled(task_id)
+    contract_payload = _pending_validation_contract_payload(scan_payload)
+    if contract_payload is not None:
+        auto_confirmed = False
+        if auto_accept:
+            try:
+                auto_confirmed = confirm_unambiguous_contract(
+                    db_path=repo.db_path,
+                    task_id=task_id,
+                )
+            except Exception:
+                auto_confirmed = False
+        if auto_confirmed:
+            repo.add_agent_message(
+                task_id,
+                role="assistant",
+                stage="scan",
+                content="The field contract is clear and has been automatically confirmed with the sole result of identification and continues to be validated.",
+                metadata={
+                    **model_metadata(model_profile),
+                    "auto_confirmed_input_contract": True,
+                },
+            )
+        else:
+            if deps.sync_agent_batch_child_progress is not None:
+                deps.sync_agent_batch_child_progress(
+                    db_path=repo.db_path,
+                    child_task_id=task_id,
+                    status="awaiting_confirmation",
+                    stage="input_confirmation",
+                )
+            add_agent_input_confirmation_prompt(
+                repo,
+                task_id=task_id,
+                model_profile=model_profile,
+                contract_payload=contract_payload,
+            )
+            return True
+    if not auto_accept:
+        add_agent_continue_prompt(
+            repo,
+            task_id,
+            model_profile,
+            next_stage="reproducibility",
+            validation_workflow_version=task.validation_workflow_version,
+        )
+    return True
+
+
+def _pending_validation_contract_payload(scan_payload: object) -> dict | None:
+    if not isinstance(scan_payload, dict):
+        return None
+    payload = scan_payload.get("validation_input_contract")
+    if not isinstance(payload, dict) or payload.get("status") != "pending_confirmation":
+        return None
+    return payload
+
+
+def add_agent_input_confirmation_prompt(
+    repo: TaskRepository,
+    *,
+    task_id: str,
+    model_profile: dict,
+    contract_payload: dict,
+) -> None:
+    status = str(contract_payload.get("status") or "missing")
+    revision = contract_payload.get("revision")
+    contract = contract_payload.get("contract")
+    candidates = contract.get("candidates") if isinstance(contract, dict) else None
+    candidate_rows: list[list[str]] = []
+    omitted_candidates = 0
+    if isinstance(candidates, dict):
+        candidate_fields = sorted(candidates.items())
+        for field_index, (field_name, values) in enumerate(candidate_fields):
+            if not isinstance(values, list):
+                continue
+            visible = values[:MAX_INPUT_CONFIRMATION_CANDIDATES_PER_FIELD]
+            omitted_candidates += len(values) - len(visible)
+            for candidate_index, candidate in enumerate(visible):
+                if len(candidate_rows) >= MAX_INPUT_CONFIRMATION_CANDIDATE_LINES:
+                    omitted_candidates += len(visible) - candidate_index
+                    break
+                if not isinstance(candidate, dict) or "value" not in candidate:
+                    continue
+                rendered = json.dumps(
+                    _candidate_preview_value(candidate["value"]),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if len(rendered) > MAX_INPUT_CONFIRMATION_VALUE_CHARS:
+                    rendered = (
+                        rendered[: MAX_INPUT_CONFIRMATION_VALUE_CHARS - 1] + "…"
+                    )
+                candidate_rows.append([str(field_name), rendered])
+            if len(candidate_rows) >= MAX_INPUT_CONFIRMATION_CANDIDATE_LINES:
+                omitted_candidates += sum(
+                    len(value)
+                    for _name, value in candidate_fields[field_index + 1 :]
+                    if isinstance(value, list)
+                )
+                break
+    if omitted_candidates:
+        candidate_rows.append(["…", f"The remaining candidate has been omitted (%){omitted_candidates} (Items)"])
+    candidate_tables = (
+        [
+            {
+                "title": "Authenticate field candidates",
+                "columns": ["Authentication Fields", "Candidate"],
+                "rows": candidate_rows,
+            }
+        ]
+        if candidate_rows
+        else []
+    )
+    candidate_intro = (
+        "Candidature fields have been organized as the following table."
+        if candidate_rows
+        else "There are no candidate fields that can be automatically confirmed at this time."
+    )
+    repo.add_agent_message(
+        task_id,
+        role="assistant",
+        stage="input_confirmation",
+        content=(
+            f"Verify input contract status as{status}"
+            f"(revision {revision})."
+            f"{candidate_intro}"
+            "Please confirm the interface for validation fields first and submit them; the contract status becomesready The blogger says:"
+            "Reply to \" Go on \" . The platform will not be implemented until confirmation is completedPMML Rating tests."
+        ),
+        metadata={
+            **model_metadata(model_profile),
+            "tables": candidate_tables,
+            "awaiting_validation_input_confirmation": True,
+            "validation_input_contract_ref": {
+                "task_id": task_id,
+                "revision": revision,
+                "status": status,
+                "needs_confirmation": bool(
+                    contract_payload.get("needs_confirmation", True)
+                ),
+            },
+        },
+    )
+
+
+def _candidate_preview_value(value: object, *, depth: int = 0) -> object:
+    if isinstance(value, str):
+        if len(value) <= MAX_INPUT_CONFIRMATION_VALUE_CHARS:
+            return value
+        return value[: MAX_INPUT_CONFIRMATION_VALUE_CHARS - 1] + "…"
+    if depth >= 3:
+        return "…"
+    if isinstance(value, list):
+        preview = [
+            _candidate_preview_value(item, depth=depth + 1) for item in value[:5]
+        ]
+        if len(value) > 5:
+            preview.append(f"… {len(value) - 5} more")
+        return preview
+    if isinstance(value, dict):
+        items = sorted(value.items(), key=lambda item: str(item[0]))
+        preview = {
+            str(key): _candidate_preview_value(item, depth=depth + 1)
+            for key, item in items[:5]
+        }
+        if len(items) > 5:
+            preview["…"] = f"{len(items) - 5} more"
+        return preview
+    return value
+
+
+def run_agent_reproducibility_stage(
+    repo: TaskRepository,
+    settings,
+    task_id: str,
+    model_profile: dict,
+    *,
+    auto_accept: bool = False,
+    deps: ValidationStageDependencies,
+) -> bool:
+    task = repo.get_task(task_id)
+    _require_ready_contract_for_v2(settings, task)
+    uses_pmml_scoring = (
+        task.task_type == TASK_TYPE_VALIDATION
+        and task.validation_workflow_version == 2
+    )
+    repo.update_status(
+        task_id,
+        TaskStatus.RUNNING,
+        "agent PMML scoring queued" if uses_pmml_scoring else "agent notebook queued",
+        expected={TaskStatus.SCANNED, TaskStatus.FAILED},
+    )
+    raise_if_agent_cancelled(task_id)
+    stage_runner = (
+        deps.run_pmml_scoring_stage if uses_pmml_scoring else deps.run_notebook_stage
+    )
+    stage_kwargs = {
+        "task_id": task_id,
+        "settings": deps.agent_pipeline_settings(settings, task),
+        "stage_claimed": True,
+    }
+    if uses_pmml_scoring:
+        stage_kwargs["cancellation_check"] = lambda: raise_if_agent_cancelled(
+            task_id
+        )
+    stage_runner(**stage_kwargs)
+    raise_if_agent_cancelled(task_id)
+    task = repo.get_task(task_id)
+    if task.status == TaskStatus.FAILED:
+        evidence = deps.agent_evidence_from_settings(settings, task_id)
+        add_agent_failure_summary(
+            repo,
+            task_id=task_id,
+            task=task,
+            stage_label="PMMLRating" if uses_pmml_scoring else "Recurrence of models",
+            error=task.status_message,
+            model_profile=model_profile,
+            deps=deps,
+            evidence=evidence,
+        )
+        return False
+    evidence = deps.agent_evidence_from_settings(settings, task_id)
+    memory_store = AgentMemoryStore(settings.db_path)
+    memory_context = agent_memory_context_from_store(
+        memory_store,
+        task,
+        stage="reproducibility",
+        evidence=evidence,
+    )
+    message = add_and_stream_agent_message(
+        repo,
+        task_id,
+        stage="reproducibility",
+        model_profile=model_profile,
+        producer=lambda on_delta: deps.summarize_stage(
+            task=task,
+            stage="reproducibility",
+            evidence=evidence,
+            memory_context=memory_context,
+            model_profile=model_profile,
+            fallback=(
+                "PMMLRating tests have been completed and the results of this rating will be used for subsequent effects, stability and stress tests."
+                if uses_pmml_scoring
+                else "The fraction consistency phase has been completed and please see the breakdown of remnant evidence."
+            ),
+            on_delta=on_delta,
+        ),
+        raise_if_cancelled=raise_if_agent_cancelled,
+    )
+    audit_agent_memory_use_from_store(memory_store, message, task_id=task_id)
+    raise_if_agent_cancelled(task_id)
+    if not auto_accept:
+        add_agent_continue_prompt(repo, task_id, model_profile, next_stage="metrics")
+    return True
+
+
+def run_agent_metrics_stage(
+    repo: TaskRepository,
+    settings,
+    task_id: str,
+    model_profile: dict,
+    *,
+    auto_accept: bool = False,
+    deps: ValidationStageDependencies,
+) -> bool:
+    task = repo.get_task(task_id)
+    _require_ready_contract_for_v2(settings, task)
+    if task.status == TaskStatus.FAILED and deps.is_metrics_failure(task):
+        expected_statuses = {
+            TaskStatus.FAILED,
+            TaskStatus.EXECUTED,
+            TaskStatus.WRITING_ARTIFACTS,
+            TaskStatus.SUCCEEDED,
+            TaskStatus.REVIEW_REQUIRED,
+        }
+    else:
+        expected_statuses = {
+            TaskStatus.EXECUTED,
+            TaskStatus.WRITING_ARTIFACTS,
+            TaskStatus.SUCCEEDED,
+            TaskStatus.REVIEW_REQUIRED,
+        }
+    repo.update_status(
+        task_id,
+        TaskStatus.COMPUTING_METRICS,
+        "agent metrics queued",
+        expected=expected_statuses,
+    )
+    raise_if_agent_cancelled(task_id)
+    metrics_kwargs = {
+        "task_id": task_id,
+        "settings": deps.agent_pipeline_settings(settings, task),
+        "stage_claimed": True,
+    }
+    if task.validation_workflow_version == 2:
+        metrics_kwargs["cancellation_check"] = lambda: raise_if_agent_cancelled(
+            task_id
+        )
+    deps.run_metrics_stage(**metrics_kwargs)
+    raise_if_agent_cancelled(task_id)
+    task = repo.get_task(task_id)
+    if task.status == TaskStatus.FAILED:
+        evidence = deps.agent_evidence_from_settings(settings, task_id)
+        add_agent_failure_summary(
+            repo,
+            task_id=task_id,
+            task=task,
+            stage_label="Effects and stability",
+            error=task.status_message,
+            model_profile=model_profile,
+            deps=deps,
+            evidence=evidence,
+        )
+        return False
+    evidence = deps.agent_evidence_from_settings(settings, task_id)
+    memory_store = AgentMemoryStore(settings.db_path)
+    memory_context = agent_memory_context_from_store(
+        memory_store,
+        task,
+        stage="metrics",
+        evidence=evidence,
+    )
+    message = add_and_stream_agent_message(
+        repo,
+        task_id,
+        stage="metrics",
+        model_profile=model_profile,
+        producer=lambda on_delta: deps.summarize_stage(
+            task=task,
+            stage="metrics",
+            evidence=evidence,
+            memory_context=memory_context,
+            model_profile=model_profile,
+            fallback=(
+                "Effects, stability and model pressure test results are generated, please combineOOT KS,PSI and stress tests for detailed review."
+                if task.validation_workflow_version == 2
+                else "Effects, stability andExcel Indicator products are generated, please combineOOT KS,PSI and stress tests for detailed review."
+            ),
+            on_delta=on_delta,
+        ),
+        raise_if_cancelled=raise_if_agent_cancelled,
+    )
+    audit_agent_memory_use_from_store(memory_store, message, task_id=task_id)
+    raise_if_agent_cancelled(task_id)
+    if not auto_accept:
+        add_agent_continue_prompt(
+            repo, task_id, model_profile, next_stage="word_conclusion_draft"
+        )
+    return True
+
+
+def run_agent_word_conclusion_stage(
+    repo: TaskRepository,
+    settings,
+    task_id: str,
+    model_profile: dict,
+    draft_message_id: str | None = None,
+    *,
+    auto_accept: bool = False,
+    rewrite_instruction: str | None = None,
+    deps: ValidationStageDependencies,
+) -> bool:
+    task = repo.get_task(task_id)
+    _require_ready_contract_for_v2(settings, task)
+    evidence = deps.agent_evidence_from_settings(settings, task_id)
+    evidence = _word_conclusion_evidence_with_stage_summaries(repo, task_id, evidence)
+    memory_store = AgentMemoryStore(settings.db_path)
+    memory_context = agent_memory_context_from_store(
+        memory_store,
+        task,
+        stage="word_conclusion_draft",
+        evidence=evidence,
+        user_message=rewrite_instruction or "",
+    )
+    draft_result: dict[str, object] = {}
+
+    def produce_draft(_on_delta):
+        _, report_revision = repo.get_report_values(task_id)
+        values, metadata = deps.generate_word_conclusions(
+            task=task,
+            evidence=evidence,
+            memory_context=memory_context,
+            model_profile=model_profile,
+            user_instruction=rewrite_instruction,
+        )
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        narrative_source = "agent_generated"
+        if not isinstance(values, dict) or not agent_conclusions_confirmed(values):
+            values = deps.fallback_word_conclusions(task=task, evidence=evidence)
+            narrative_source = "deterministic_fallback"
+            metadata.update({
+                "fallback": True,
+                "deterministic_fallback": True,
+                "confirmable": False,
+            })
+        draft_result["values"] = values
+        draft_result["metadata"] = metadata
+        draft_result["report_revision"] = report_revision
+        draft_result["narrative_source"] = narrative_source
+        return (
+            format_conclusion_values(values),
+            {**metadata, "draft_values": values, "report_revision": report_revision},
+        )
+
+    if draft_message_id:
+        message = stream_agent_message(
+            repo,
+            draft_message_id,
+            task_id=task_id,
+            model_profile=model_profile,
+            producer=produce_draft,
+            raise_if_cancelled=raise_if_agent_cancelled,
+        )
+    else:
+        message = add_and_stream_agent_message(
+            repo,
+            task_id,
+            stage="word_conclusion_draft",
+            model_profile=model_profile,
+            producer=produce_draft,
+            raise_if_cancelled=raise_if_agent_cancelled,
+        )
+    audit_agent_memory_use_from_store(memory_store, message, task_id=task_id)
+    values = draft_result.get("values")
+    if not isinstance(values, dict) or not agent_conclusions_confirmed(values):
+        add_agent_word_draft_failure_message(
+            repo,
+            task_id=task_id,
+            model_profile=model_profile,
+            metadata=draft_result.get("metadata"),
+        )
+        return False
+    if auto_accept:
+        return generate_agent_report_from_conclusions(
+            repo=repo,
+            settings=settings,
+            task_id=task_id,
+            model_profile=model_profile,
+            values=draft_result.get("values"),
+            expected_revision=draft_result.get("report_revision"),
+            narrative_source=str(
+                draft_result.get("narrative_source") or "agent_generated"
+            ),
+            deps=deps,
+        )
+    return True
+
+
+def _word_conclusion_evidence_with_stage_summaries(
+    repo: TaskRepository,
+    task_id: str,
+    evidence: object,
+) -> dict:
+    payload = dict(evidence) if isinstance(evidence, dict) else {}
+    messages = repo.list_agent_messages(task_id)
+    summaries = _visible_stage_summaries_for_word_conclusion(messages)
+    if summaries:
+        payload["visible_stage_summaries"] = summaries
+    report_draft = latest_report_draft_context(messages)
+    if report_draft:
+        payload["report_draft"] = report_draft
+    return payload
+
+
+def _visible_stage_summaries_for_word_conclusion(messages: list[dict]) -> list[dict]:
+    summaries: list[dict] = []
+    excluded_stages = {
+        "chat",
+        "word_conclusion_draft",
+        "word_conclusion_generated",
+        "word_conclusion_confirmed",
+        "word_report_ready",
+    }
+    for message in messages[-16:]:
+        if message.get("role") != "assistant":
+            continue
+        stage = str(message.get("stage") or "")
+        content = str(message.get("content") or "").strip()
+        if not stage or stage in excluded_stages or not content:
+            continue
+        summaries.append({"stage": stage, "content": content})
+    return summaries
+
+
+def add_agent_word_draft_failure_message(
+    repo: TaskRepository,
+    *,
+    task_id: str,
+    model_profile: dict,
+    metadata: object,
+) -> None:
+    llm_error = ""
+    if isinstance(metadata, dict):
+        llm_error = str(metadata.get("llm_error") or "").strip()
+    detail = f"Direct causes:{llm_error}" if llm_error else "Direct cause: Large model did not return complete three segmentsJSON Draft."
+    repo.add_agent_message(
+        task_id,
+        role="assistant",
+        stage="chat",
+        content=(
+            "The draft report conclusions were not produced and no three paragraphs were identifiedWord And the conclusions are not written.Word."
+            f"{detail} Please downsize the model that you enter, switch to a larger context window, or recreate the draft report conclusions."
+        ),
+        metadata={
+            **model_metadata(model_profile),
+            "word_draft_failed": True,
+            **({"llm_error": llm_error} if llm_error else {}),
+        },
+    )
+
+
+def generate_agent_report_from_conclusions(
+    *,
+    repo: TaskRepository,
+    settings,
+    task_id: str,
+    model_profile: dict,
+    values: object,
+    expected_revision: object,
+    narrative_source: str = "agent_generated",
+    deps: ValidationStageDependencies,
+) -> bool:
+    if (
+        not isinstance(values, dict)
+        or not agent_conclusions_confirmed(values)
+        or not isinstance(expected_revision, int)
+        or isinstance(expected_revision, bool)
+    ):
+        raise RuntimeError("agent report narratives are incomplete; cannot generate report")
+    conclusion_values = {
+        key: str(values.get(key) or "").strip()
+        for key in AGENT_REPORT_WRITABLE_KEYS
+        if str(values.get(key) or "").strip()
+    }
+    for key in REQUIRED_AGENT_REPORT_KEYS:
+        conclusion_values[key] = str(values.get(key) or "").strip()
+    revision = repo.update_agent_report_conclusions_with_audit(
+        task_id,
+        conclusion_values,
+        expected_revision=expected_revision,
+        audit={
+            "kind": "report.agent_conclusions.generated",
+            "target_ref": task_id,
+            "outcome": "succeeded",
+            "detail": {
+                "keys": sorted(conclusion_values),
+                "expected_revision": expected_revision,
+                "source": narrative_source,
+            },
+        },
+    )
+    repo.add_agent_message(
+        task_id,
+        role="assistant",
+        stage="word_conclusion_generated",
+        content=(
+            "The results of the large model report failed to produce, and the platform has used certainty indicators to generate conservative backsliding text."
+            "Generating the finality directlyWord Report; manual review upon completion."
+            if narrative_source == "deterministic_fallback"
+            else "The report findings have been generated and are being generated directly and ultimatelyWord Report."
+        ),
+        metadata={
+            **model_metadata(model_profile),
+            "revision": revision,
+            "generated_keys": sorted(REQUIRED_AGENT_REPORT_KEYS),
+            "narrative_source": narrative_source,
+        },
+    )
+    raise_if_agent_cancelled(task_id)
+    deps.run_report_stage(
+        task_id=task_id,
+        settings=deps.agent_pipeline_settings(settings, repo.get_task(task_id)),
+    )
+    raise_if_agent_cancelled(task_id)
+    task = repo.get_task(task_id)
+    if task.status == TaskStatus.FAILED:
+        add_agent_failure_summary(
+            repo,
+            task_id=task_id,
+            task=task,
+            stage_label="Report Generation",
+            error=task.status_message,
+            model_profile=model_profile,
+            deps=deps,
+        )
+        return False
+    deps.add_agent_report_ready_message(repo, task_id)
+    if deps.sync_agent_batch_after_child_report is not None:
+        deps.sync_agent_batch_after_child_report(
+            settings=settings,
+            child_task_id=task_id,
+        )
+    return True
+
+
+def auto_confirm_agent_report_conclusions(
+    *,
+    repo: TaskRepository,
+    settings,
+    task_id: str,
+    model_profile: dict,
+    values: object,
+    expected_revision: object,
+    narrative_source: str = "agent_generated",
+    deps: ValidationStageDependencies,
+) -> bool:
+    """Compatibility alias for callers predating direct report generation."""
+    return generate_agent_report_from_conclusions(
+        repo=repo,
+        settings=settings,
+        task_id=task_id,
+        model_profile=model_profile,
+        values=values,
+        expected_revision=expected_revision,
+        narrative_source=narrative_source,
+        deps=deps,
+    )
+
+
+def add_agent_failure_summary(
+    repo: TaskRepository,
+    *,
+    task_id: str,
+    task: TaskRecord,
+    stage_label: str,
+    error: str,
+    model_profile: dict,
+    deps: ValidationStageDependencies,
+    evidence: dict | None = None,
+) -> None:
+    add_and_stream_agent_message(
+        repo,
+        task_id,
+        stage="failure",
+        model_profile=model_profile,
+        producer=lambda on_delta: deps.failure_summary(
+            task=task,
+            stage=stage_label,
+            error=error,
+            evidence=evidence,
+            model_profile=model_profile,
+            on_delta=on_delta,
+        ),
+        raise_if_cancelled=raise_if_agent_cancelled,
+    )
+
+
+def add_agent_continue_prompt(
+    repo: TaskRepository,
+    task_id: str,
+    model_profile: dict,
+    *,
+    next_stage: str,
+    validation_workflow_version: int | None = None,
+) -> None:
+    repo.add_agent_message(
+        task_id,
+        role="assistant",
+        stage="chat",
+        content=(
+            "Continue with [T]"
+            f"{agent_stage_label(next_stage, validation_workflow_version=validation_workflow_version)}"
+            "]?"
+            "You may continue with the questions; if you need to continue, please respond explicitly to the words (continue)."
+        ),
+        metadata={**model_metadata(model_profile), "awaiting_next_stage": next_stage},
+    )
