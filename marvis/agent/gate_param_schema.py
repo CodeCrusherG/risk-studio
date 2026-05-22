@@ -1,0 +1,159 @@
+"""Adjustable-parameter schema summary for a gate (AGT-5).
+
+``route_instruction`` previously saw only the gate title, so the routing LLM had
+to blind-guess ``adjust`` parameter names/values from free text alone — a wrong
+guess meant ``apply_adjust`` matched nothing and the user just saw "No recognition.
+Parameters for adjustment" (gate_execution_adapter.py). This module assembles the same
+parameter names ``apply_adjust`` would actually accept — one entry per key in
+each dependency step's ``inputs`` — plus type/current-value/bounds (from
+``adjust_specs`` where the key is a recognised typed control), so the router can
+be told up front which keys exist instead of discovering it after a failed
+attempt.
+
+Pure + deterministic: no LLM call, just reads ``plan``/``gate`` state.
+"""
+
+from __future__ import annotations
+
+from marvis.agent.adjust_specs import (
+    NONNEGATIVE_INT_ADJUST_PARAMS,
+    POSITIVE_INT_ADJUST_PARAMS,
+    SUPPORTED_MODELING_RECIPES,
+    UNIT_INTERVAL_ADJUST_PARAMS,
+)
+from marvis.agent.plan_utils import find_step
+from marvis.orchestrator.contracts import Plan, PlanStep
+
+_UNIT_INTERVAL_BOUNDS = {"min": 0, "max": 1}
+_POSITIVE_INT_BOUNDS = {"min": 1}
+_NONNEGATIVE_INT_BOUNDS = {"min": 0}
+_MODELING_RECIPE_ENUM = tuple(sorted(SUPPORTED_MODELING_RECIPES))
+
+
+def gate_param_schema(
+    plan: Plan,
+    gate: PlanStep | None,
+    *,
+    editable_input_schema: dict | None = None,
+) -> list[dict]:
+    """Adjustable-parameter summary for ``gate``'s dependency step(s).
+
+    Returns a list of ``{"name", "type", "current", "bounds", "enum"}`` dicts
+    (bounds/enum omitted when unknown), one per input key across every dependency
+    step — exactly the key set ``GateExecutionAdapter.apply_adjust`` matches
+    ``params`` against. Deterministic ordering (dependency order, then input-key
+    sort) so prompts stay stable across otherwise-identical calls."""
+    if gate is None:
+        return []
+    # A tool-specific gate adapter is the authoritative allowlist. In
+    # particular, monitoring disposition exposes only disposition/reason/
+    # threshold_patch; immutable run and plan receipt inputs must never be
+    # suggested to the routing LLM as adjustable parameters.
+    editable_properties = (
+        editable_input_schema.get("properties")
+        if isinstance(editable_input_schema, dict)
+        else None
+    )
+    if isinstance(editable_properties, dict) and editable_properties:
+        return _editable_schema_entries(gate, editable_properties)
+    seen: set[str] = set()
+    schema: list[dict] = []
+    for dep_id in gate.depends_on or []:
+        dep = find_step(plan, dep_id)
+        if dep is None:
+            continue
+        for key in sorted((dep.inputs or {}).keys()):
+            if key in seen:
+                continue
+            seen.add(key)
+            value = dep.inputs[key]
+            entry = {"name": key, "type": _type_name(value), "current": value}
+            enum = _enum_for(key)
+            if enum:
+                # ``enum`` is the machine-readable contract.  Keep the same
+                # values under ``bounds`` as well because the instruction
+                # router already renders that field into the LLM prompt.  This
+                # means the router sees canonical recipe identifiers instead
+                # of having to invent abbreviations such as ``cat``.
+                entry["enum"] = enum
+                entry["bounds"] = {"enum": enum}
+            else:
+                bounds = _bounds_for(key)
+                if bounds:
+                    entry["bounds"] = bounds
+            schema.append(entry)
+    return schema
+
+
+def _editable_schema_entries(
+    gate: PlanStep,
+    properties: dict,
+) -> list[dict]:
+    entries: list[dict] = []
+    for name in sorted(str(key) for key in properties):
+        raw = properties.get(name)
+        spec = raw if isinstance(raw, dict) else {}
+        declared_type = spec.get("type")
+        if isinstance(declared_type, list):
+            kind = next(
+                (str(item) for item in declared_type if str(item) != "null"),
+                "null",
+            )
+        elif isinstance(declared_type, str):
+            kind = declared_type
+        else:
+            kind = _type_name((gate.inputs or {}).get(name))
+        entry = {
+            "name": name,
+            "type": kind,
+            "current": (gate.inputs or {}).get(name),
+        }
+        bounds = {
+            key: spec[key]
+            for key in ("minimum", "maximum", "minLength", "maxLength")
+            if key in spec
+        }
+        if bounds:
+            entry["bounds"] = bounds
+        enum = spec.get("enum")
+        if isinstance(enum, list):
+            entry["enum"] = list(enum)
+        entries.append(entry)
+    return entries
+
+
+def _type_name(value) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    if value is None:
+        return "null"
+    return "string"
+
+
+def _bounds_for(key: str) -> dict | None:
+    if key in UNIT_INTERVAL_ADJUST_PARAMS:
+        return dict(_UNIT_INTERVAL_BOUNDS)
+    if key in POSITIVE_INT_ADJUST_PARAMS:
+        return dict(_POSITIVE_INT_BOUNDS)
+    if key in NONNEGATIVE_INT_ADJUST_PARAMS:
+        return dict(_NONNEGATIVE_INT_BOUNDS)
+    return None
+
+
+def _enum_for(key: str) -> list[str] | None:
+    if key == "recipes":
+        return list(_MODELING_RECIPE_ENUM)
+    return None
+
+
+__all__ = ["gate_param_schema"]

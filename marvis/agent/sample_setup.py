@@ -1,0 +1,369 @@
+"""Deterministic sample setup detection shared by the feature/modeling drivers.
+
+Reads only a row sample (for dtypes/binary checks) plus the key columns in full
+(for counts/bad-rate) — never the whole frame — and proposes the target column,
+the train/test/oot split column + values, and the numeric candidate features
+(ids / time / weight columns excluded). Extracted from the original conversational
+modeling prototype so both feature_analysis and modeling can reuse it.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import re
+from typing import Optional
+
+from marvis.feature.candidates import (
+    candidate_numeric_features,
+    excluded_categorical_columns,
+    excluded_numeric_columns,
+    is_meta_column,
+)
+
+# Preferred binary-target name tokens, most-specific first.
+_TARGET_PRIORITY = (
+    "long_y", "fission_y", "y", "label", "target",
+    "is_bad", "bad_flag", "flag_bad", "bad", "default", "dpd", "fpd",
+)
+# Recognised split-membership values (lower-cased).
+_SPLIT_TRAIN = {"train", "training", "dev", "develop", "development", "build"}
+_SPLIT_TEST = {"test", "testing", "valid", "validation", "val", "holdout"}
+_SPLIT_OOT = {"oot", "ootest", "out_of_time", "oos", "time_oot"}
+# Preferred continuous-target name tokens, most-specific first (case-insensitive).
+_CONTINUOUS_TARGET_TOKENS = (
+    "income", "amount", "amt", "balance", "limit",
+    "loan_amount", "gmv", "revenue", "price", "salary",
+)
+# Preferred multiclass-target name tokens (case-insensitive).
+_MULTICLASS_TARGET_TOKENS = (
+    "risk_grade", "risk_band", "grade", "rating", "class", "level", "target",
+    "Level", "Rating", "Category",
+)
+# A multiclass target must have between this many distinct classes (inclusive).
+_MULTICLASS_MIN_CLASSES = 3
+_MULTICLASS_MAX_CLASSES = 20
+
+
+@dataclass
+class SetupProposal:
+    target_col: str
+    split_col: Optional[str]
+    split_values: dict[str, str]
+    candidates: list[str]
+    counts: dict[str, int]
+    bad_rate: Optional[float]
+    notes: list[str]
+    excluded_categorical: list[dict] = None  # type: ignore[assignment]
+    excluded_numeric: list[dict] = None  # type: ignore[assignment]
+    target_candidates: list[str] = None  # type: ignore[assignment]
+    # MEM-4: which of target_col/split_col (if any) were picked because they
+    # matched a historical field_convention memory hint rather than the
+    # deterministic heuristics alone — used only to annotate the gate message
+    # ("History mission used"); never changes downstream behavior.
+    memory_matched_fields: list[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.excluded_categorical is None:
+            self.excluded_categorical = []
+        if self.excluded_numeric is None:
+            self.excluded_numeric = []
+        if self.target_candidates is None:
+            self.target_candidates = []
+        if self.memory_matched_fields is None:
+            self.memory_matched_fields = []
+
+
+def _is_binary(series) -> bool:
+    vals = set(series.dropna().unique().tolist())
+    return vals.issubset({0, 1, 0.0, 1.0, True, False}) and len(vals) == 2
+
+
+def _target_name_rank(column: str) -> int | None:
+    """Return a conservative target-name rank.
+
+    A bare ``y`` is a useful label name, but treating it as an arbitrary
+    substring made every column containing the letter (and pandas ``*_y`` join
+    suffixes) look like a preferred target.  Multi-word hints still use token
+    boundaries where possible; established names such as ``long_y`` retain
+    their explicit higher-priority entries.
+    """
+
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(column).lower()).strip("_")
+    tokens = set(normalized.split("_"))
+    for index, hint in enumerate(_TARGET_PRIORITY):
+        if hint == "y":
+            matched = normalized == "y"
+        elif "_" in hint:
+            matched = hint in normalized
+        else:
+            matched = hint in tokens or normalized.startswith(f"{hint}_")
+        if matched:
+            return index
+    return None
+
+
+def detect_setup(
+    backend,
+    path: Path,
+    *,
+    configured_target: str = "",
+    configured_split: str = "",
+    sample_rows: int = 4000,
+    target_type: str = "binary",
+    field_hints: Optional[dict] = None,
+    include_columns: tuple[str, ...] | list[str] = (),
+) -> SetupProposal:
+    """Propose target column, split column/values and numeric candidate features.
+
+    ``target_type`` defaults to ``"binary"`` (the existing 0/1 detection — the
+    feature_analysis flow never passes it, so its behaviour is unchanged). When
+    ``"continuous"`` the target column is resolved as a numeric column (for a
+    regression task) and ``bad_rate`` is left ``None``.
+
+    ``field_hints`` (MEM-4, optional): ``{"target_col": ..., "split_col": ...}``
+    sourced from a historical field_convention memory. It is a pure *ordering*
+    tie-breaker over the same deterministic candidate pool the heuristics would
+    already consider — a hinted column only wins when it independently passes
+    the exact same validity check an explicit ``configured_target``/
+    ``configured_split`` would (binary dtype for the target; a real
+    train/test-or-oot split-value mapping for the split). It can never conjure a
+    candidate the detector would not otherwise accept, so the detection
+    algorithm itself stays fully deterministic (INV-4).
+    """
+    columns = backend.column_names(path)
+    # Random sample (NOT a head slice) — samples are often ordered by split, so a
+    # head read would miss whole splits and skew dtype/binary detection.
+    probe = backend.sample_rows(path, sample_rows, seed=0)
+    notes: list[str] = []
+    continuous = target_type == "continuous"
+    multiclass = target_type == "multiclass"
+    hints = field_hints if isinstance(field_hints, dict) else {}
+    hinted_target = str(hints.get("target_col") or "").strip()
+    hinted_split = str(hints.get("split_col") or "").strip()
+    memory_matched_fields: list[str] = []
+
+    # -- target ---------------------------------------------------------------
+    target = ""
+    target_candidates: list[str] = []
+    if continuous:
+        target = _detect_continuous_target(probe, configured_target)
+        if not target:
+            notes.append("Return tasks should specify a continuous target line.")
+    elif multiclass:
+        target = _detect_multiclass_target(probe, configured_target)
+        if not target:
+            notes.append("Multiple job categories should be specified 3-20 Category of target column.")
+    else:
+        if configured_target and configured_target in probe.columns and _is_binary(probe[configured_target]):
+            target = configured_target
+        if (
+            not target
+            and not configured_target
+            and hinted_target
+            and hinted_target in probe.columns
+            and _is_binary(probe[hinted_target])
+        ):
+            target = hinted_target
+            memory_matched_fields.append("target_col")
+        if not target:
+            binary_cols = [c for c in probe.columns if _is_binary(probe[c])]
+            target_candidates = [str(column) for column in binary_cols]
+            ranked = sorted(
+                ((column, _target_name_rank(str(column))) for column in binary_cols),
+                key=lambda item: (
+                    item[1] is None,
+                    item[1] if item[1] is not None else len(_TARGET_PRIORITY),
+                    binary_cols.index(item[0]),
+                ),
+            )
+            named = [item for item in ranked if item[1] is not None]
+            if named:
+                best_rank = named[0][1]
+                best = [column for column, rank in named if rank == best_rank]
+                # Two equally plausible business labels are different target
+                # definitions, not a stable source-order tie-break.  C1 must ask.
+                target = best[0] if len(best) == 1 else ""
+            elif len(binary_cols) == 1:
+                target = binary_cols[0]
+        if not target:
+            notes.append("Unable to identify only 0/1 Target column, please direct me to the target list.")
+
+    # -- split ----------------------------------------------------------------
+    split_col = ""
+    split_values: dict[str, str] = {}
+    by_name = [configured_split] if configured_split in columns else []
+    if not configured_split and hinted_split and hinted_split in columns:
+        # Memory tie-breaker: try the historically-used split column first, right
+        # after any explicit configured_split — it still must pass the same
+        # train/test-or-oot mapping check below to actually be selected.
+        by_name = [*by_name, hinted_split]
+    by_name += [c for c in columns if _looks_like_split_name(c)]
+    obj_cols = [c for c in probe.columns if probe[c].dtype == object and probe[c].nunique(dropna=True) <= 8]
+    for cand in dict.fromkeys(c for c in (by_name + obj_cols) if c):
+        col = backend.read_frame(path, columns=[cand])[cand]
+        mapping = _classify_split_values(col)
+        if "train" in mapping and ("test" in mapping or "oot" in mapping):
+            split_col, split_values = cand, mapping
+            if not configured_split and cand == hinted_split:
+                memory_matched_fields.append("split_col")
+            break
+    if not split_col:
+        notes.append("Could not close temporary folder: %strain/test/oot Cut; can specify cut or I cut you by time field.")
+    if memory_matched_fields:
+        labels = ",".join(
+            {"target_col": "Target column", "split_col": "Cut"}[field] for field in memory_matched_fields
+        )
+        notes.append(f"{labels}:It's the same caliber as the historical mission (from memory).")
+
+    # -- candidate features (numeric, minus target/split/meta) ----------------
+    candidates = candidate_numeric_features(
+        backend,
+        path,
+        target_col=target,
+        split_col=split_col,
+        sample_rows=sample_rows,
+        include_columns=include_columns,
+    )
+    excluded_numeric = excluded_numeric_columns(
+        backend,
+        path,
+        target_col=target,
+        split_col=split_col,
+        sample_rows=sample_rows,
+        include_columns=include_columns,
+    )
+    if excluded_numeric:
+        preview = ",".join(
+            f"{item.column}({item.reason})" for item in excluded_numeric[:8]
+        )
+        more = f" Wait{len(excluded_numeric)} individual" if len(excluded_numeric) > 8 else ""
+        notes.append(
+            f"{len(excluded_numeric)} No candidate for a numerical technology field:{preview}{more};"
+            "If you really need to analyse, you can add a visible feature column to the profile when you create the task."
+        )
+
+    # -- excluded categorical columns (PREP-3/FS-3: never silently drop) ------
+    excluded_categorical = excluded_categorical_columns(
+        backend,
+        path,
+        target_col=target,
+        split_col=split_col,
+        sample_rows=sample_rows,
+    )
+    if excluded_categorical:
+        preview = ",".join(
+            f"{item.column}(Base{item.cardinality})" for item in excluded_categorical[:8]
+        )
+        more = f" Wait{len(excluded_categorical)} individual" if len(excluded_categorical) > 8 else ""
+        notes.append(
+            f"{len(excluded_categorical)} Unmolded Class Columns:{preview}{more};"
+            "If you need one, you can use it first.woe_encode_categorical Encoding, or changingcatboost(Original Support Category Column)."
+        )
+
+    # -- counts / bad-rate (read only key columns in full) --------------------
+    counts: dict[str, int] = {}
+    bad_rate: Optional[float] = None
+    key_cols = [c for c in {target, split_col} if c]
+    if key_cols:
+        keys = backend.read_frame(path, columns=key_cols)
+        # bad_rate is a binary-only notion (mean of a 0/1 label); regression and
+        # multiclass targets have no bad_rate, so leave it None for those tasks.
+        if target and target in keys and not continuous and not multiclass:
+            bad_rate = float(keys[target].mean())
+        if split_col and split_col in keys:
+            counts = {
+                role: int((keys[split_col] == val).sum())
+                for role, val in split_values.items()
+            }
+    return SetupProposal(
+        target,
+        split_col or None,
+        split_values,
+        candidates,
+        counts,
+        bad_rate,
+        notes,
+        excluded_categorical=[
+            {"column": item.column, "cardinality": item.cardinality} for item in excluded_categorical
+        ],
+        excluded_numeric=[
+            {"column": item.column, "reason": item.reason} for item in excluded_numeric
+        ],
+        target_candidates=target_candidates,
+        memory_matched_fields=memory_matched_fields,
+    )
+
+
+def _detect_continuous_target(probe, configured_target: str) -> str:
+    """Resolve the continuous (regression) target column from a row sample.
+
+    Prefer ``configured_target`` when it is present and numeric; otherwise pick the
+    first numeric column whose name matches a known continuous-target token (income,
+    amount, …). Returns "" when no numeric candidate is found (caller adds a note)."""
+    numeric_cols = list(probe.select_dtypes("number").columns)
+    if (
+        configured_target
+        and configured_target in probe.columns
+        and configured_target in numeric_cols
+    ):
+        return configured_target
+    for token in _CONTINUOUS_TARGET_TOKENS:
+        for col in numeric_cols:
+            name = str(col)
+            if _looks_like_split_name(name) or is_meta_column(name):
+                continue
+            if token in name.lower():
+                return name
+    return ""
+
+
+def _detect_multiclass_target(probe, configured_target: str) -> str:
+    """Resolve the multiclass (3-20 class) target column from a row sample.
+
+    Prefer ``configured_target`` when it has a distinct-class count in [3, 20]. Else
+    pick the first column whose name matches a known grade/rating token and whose
+    distinct-class count is in [3, 20]. Returns "" when nothing qualifies (caller adds
+    a note). The split column is never a candidate."""
+    if (
+        configured_target
+        and configured_target in probe.columns
+        and _class_count_in_range(probe[configured_target])
+    ):
+        return configured_target
+    for col in probe.columns:
+        low = str(col).lower()
+        name = str(col)
+        if not any(tok in low or tok in name for tok in _MULTICLASS_TARGET_TOKENS):
+            continue
+        if _looks_like_split_name(name):
+            continue
+        if _class_count_in_range(probe[col]):
+            return name
+    return ""
+
+
+def _class_count_in_range(series) -> bool:
+    distinct = int(series.dropna().nunique())
+    return _MULTICLASS_MIN_CLASSES <= distinct <= _MULTICLASS_MAX_CLASSES
+
+
+def _looks_like_split_name(name: str) -> bool:
+    low = name.lower()
+    return any(tok in low for tok in ("split", "flag", "set", "fold", "sample_type", "model_flag", "new_flag"))
+
+
+def _classify_split_values(series) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for raw in series.dropna().unique().tolist():
+        low = str(raw).strip().lower()
+        if low in _SPLIT_TRAIN and "train" not in mapping:
+            mapping["train"] = raw
+        elif low in _SPLIT_TEST and "test" not in mapping:
+            mapping["test"] = raw
+        elif low in _SPLIT_OOT and "oot" not in mapping:
+            mapping["oot"] = raw
+    return mapping
+
+
+__all__ = ["detect_setup", "SetupProposal"]

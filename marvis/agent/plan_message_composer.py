@@ -1,0 +1,1070 @@
+"""Message composer for PlanDriver turns.
+
+The driver owns state transitions; this module owns the assistant-facing
+message payloads and metadata envelopes returned after those transitions.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, urlencode
+
+from marvis.api_report_helpers import driver_report_download_metadata
+from marvis.data.errors import DataLayerError
+from marvis.agent.driver_turn import DriverMessage
+from marvis.agent.gate_adapters import render_gate_dependencies
+from marvis.agent.gate_payloads import build_model_delivery_payload
+from marvis.agent.gates import build_failure_envelope, extract_gate_envelope
+from marvis.agent.gates.adapters import gate_editable_input_schema
+from marvis.agent.plan_utils import downstream_step_ids, find_step
+from marvis.agent.renderers import render_tool_output
+from marvis.orchestrator.contracts import (
+    Plan,
+    PlanStep,
+    StepStatus,
+    plan_fingerprint,
+    plan_step_confirmation_fingerprint,
+)
+from marvis.plugins.manifest import governance_policy_hash
+
+
+_RESULT_DATASET_PRESENTATION_BY_TOOL = {
+    "define_label": ("Tab data set generated", "Download Tab Results"),
+    "execute_join": ("Spell result generated", "Downloading the collage result"),
+}
+_DEFAULT_RESULT_DATASET_PRESENTATION = ("Results data set generated", "Download Results Data Set")
+
+
+class PlanMessageComposer:
+    """Compose PlanDriver messages without mutating plan state."""
+
+    def __init__(
+        self,
+        *,
+        load_output: Callable[..., Any],
+        load_step_evidence: Callable[..., Any] | None = None,
+        load_step_presentation_binding: Callable[[str, str], Any] | None = None,
+        load_task_artifact: Callable[[str, str], Any] | None = None,
+        load_dataset: Callable[[str], Any] | None = None,
+        resolve_verified_dataset_path: Callable[[str], Any] | None = None,
+        tasks_root: Path | str | None = None,
+        db_path: Path | str | None = None,
+        latest_failed_step_run_error_kind: Callable[[str], str | None] | None = None,
+    ):
+        self._load_output = load_output
+        output_repository = getattr(load_output, "__self__", None)
+        self._plan_repository = output_repository
+        inferred_evidence_loader = getattr(
+            output_repository,
+            "load_step_evidence",
+            None,
+        )
+        self._load_step_evidence = (
+            load_step_evidence
+            if load_step_evidence is not None
+            else inferred_evidence_loader
+        )
+        inferred_binding_loader = getattr(
+            output_repository,
+            "load_step_presentation_binding",
+            None,
+        )
+        self._load_step_presentation_binding = (
+            load_step_presentation_binding
+            if load_step_presentation_binding is not None
+            else inferred_binding_loader
+        )
+        self._step_presentation_bindings: dict[tuple[str, str, str], dict] = {}
+        self._load_task_artifact = load_task_artifact
+        self._load_dataset = load_dataset
+        self._resolve_verified_dataset_path = resolve_verified_dataset_path
+        self._tasks_root = None if tasks_root is None else Path(tasks_root).absolute()
+        artifact_repository = getattr(
+            load_task_artifact,
+            "__self__",
+            None,
+        )
+        inferred_db_path = getattr(artifact_repository, "db_path", None)
+        effective_db_path = db_path if db_path is not None else inferred_db_path
+        self._db_path = (
+            None if effective_db_path is None else Path(effective_db_path).absolute()
+        )
+        self._workspace = (
+            None if self._db_path is None else self._db_path.parent.resolve()
+        )
+        self._latest_failed_step_run_error_kind = latest_failed_step_run_error_kind
+
+    def plan_overview_message(self, plan: Plan) -> DriverMessage:
+        order: list[str] = []
+        by_phase: dict[str, list[str]] = {}
+        for step in plan.steps:
+            phase = step.phase or "Steps"
+            if phase not in by_phase:
+                by_phase[phase] = []
+                order.append(phase)
+            by_phase[phase].append(step.title)
+        lines = ["I've generated an implementation plan that will stop at every key point and confirm it with you.:"]
+        for phase in order:
+            lines.append(f"**{phase}**:{' → '.join(by_phase[phase])}")
+        lines.append("For example, the following is a list of the most recent posts on the website:Agent The mode is \"start\" or \"continue\".")
+        meta = {
+            "plan_id": plan.id,
+            "kind": "plan_overview",
+            "confirmation_snapshot": self._confirmation_snapshot(plan),
+        }
+        meta["gate_envelope"] = extract_gate_envelope({"metadata": meta}).to_dict()
+        return DriverMessage("plan_overview", "\n".join(lines), meta)
+
+    def gate_message(
+        self, plan: Plan, gate: PlanStep | None, *, run_seq
+    ) -> DriverMessage:
+        trusted_renderer = None
+        if self._workspace is not None:
+
+            def trusted_renderer(step, output, presentation_state):
+                return self._render_step_output(
+                    plan,
+                    step,
+                    output,
+                    presentation_state=presentation_state,
+                )
+
+        rendered = render_gate_dependencies(
+            plan,
+            gate,
+            lambda step_id: self._safe_plan_step_output(plan, step_id),
+            render_output=trusted_renderer,
+        )
+        parts = rendered.parts
+        if not parts:
+            parts.append("Previous step completed.")
+        if rendered.feature_binning is not None:
+            parts.append(
+                "Single variable analysis completed. Are there features that require further box analysis?"
+                "Multiplely select features and set 3–20 box, can also skip; final report will not be generated until confirmed."
+            )
+        if rendered.special_values is not None:
+            columns = [
+                str(item.get("column") or "")
+                for item in rendered.special_values.get("columns") or []
+                if isinstance(item, dict) and str(item.get("column") or "")
+            ]
+            parts.append(
+                f"Detected**{len(columns)}** Selected features contain suspected special values."
+                "These values change the missing processing or feature collection, and the original value must be retained by row."
+                "Or \"delete the feature\"; the reservation must also be justified."
+            )
+        # The stored message is shared by both run modes. Manual-mode analysis
+        # strips this chat-only line and exposes its button; Agent mode keeps it
+        # and deliberately exposes no gate action buttons.
+        if rendered.special_values is not None:
+            parts.append(
+                "Agent Modes:"
+                "[x1 (a) To convert to empty values;x2 Delete;x3 Retention, cause: engagement value)."
+                "The answer to this question is \"confirm\" and it is not going to cross this manual decision point."
+            )
+        else:
+            parts.append(
+                "Agent The mode is described in the following language: \"Continue\" or \"Record\" if you need to adjust."
+            )
+        meta = {
+            "plan_id": plan.id,
+            "step_id": gate.id if gate else None,
+            "run_seq": run_seq,
+            "tables": rendered.tables,
+            "kind": "gate",
+            "confirmation_snapshot": self._confirmation_snapshot(plan, gate),
+        }
+        # LT-2: the gate step's own source tool is the reliable signal for the
+        # AUTO safety layer (production step_ids are opaque "{plan}-step-N"). Carry
+        # it so gates/contracts.infer_gate_envelope can set risk_flags on forced
+        # human-review gates (delivery / champion / dedup / strategy adopt) and
+        # halt a bare AUTO confirm on them.
+        if gate is not None and gate.tool_ref is not None:
+            meta["gate_source_tool"] = gate.tool_ref.tool
+        if gate is not None:
+            # Phase 0B: AUTO and the frontend consume the same immutable policy
+            # snapshot the validator accepted for this plan step.  Tool names and
+            # free-form risk text remain useful context, but are no longer the
+            # authority for whether a human must act.
+            meta["human_decision_gate"] = gate.policy.human_decision_gate
+            meta["effect_authorization"] = gate.policy.effect_authorization
+            meta["policy_hash"] = governance_policy_hash(gate.policy)
+        if rendered.output_refs:
+            meta["output_refs"] = rendered.output_refs
+        if rendered.screen is not None:
+            meta["screen"] = rendered.screen
+        if rendered.dedup is not None:
+            meta["dedup"] = rendered.dedup
+        if rendered.join_keys is not None:
+            meta["join_keys"] = rendered.join_keys
+        if rendered.modeling_setup is not None:
+            meta["modeling_setup"] = rendered.modeling_setup
+        if rendered.model_delivery is not None:
+            meta["model_delivery"] = rendered.model_delivery
+            report_output, report_step = self._report_dependency_output(plan, gate)
+            self._attach_report_download_metadata(
+                meta,
+                plan=plan,
+                report_step=report_step,
+                report_output=report_output,
+            )
+        if rendered.feature_binning is not None:
+            meta["feature_binning"] = rendered.feature_binning
+        if rendered.special_values is not None:
+            meta["special_values"] = rendered.special_values
+        if rendered.monitoring_level is not None:
+            meta["monitoring_disposition"] = {
+                "overall_level": rendered.monitoring_level,
+                "requires_structured_input": rendered.monitoring_level == "red",
+            }
+        if rendered.red_flags:
+            # AGT-9: deterministic modeling red flags (computed in
+            # gate_adapters.render_gate_dependencies straight from the tuning /
+            # select-experiment dependency outputs) ride alongside the existing
+            # screen/dedup metadata so auto_drive._extract_red_flags can surface
+            # them in the [Platform Red Flagchecklist] without re-parsing table strings.
+            meta["red_flags"] = rendered.red_flags
+        if rendered.presentation_warnings:
+            meta["presentation_warnings"] = rendered.presentation_warnings
+        # LT-3 (A.3): the gate's reply adapter declares its adjustable parameters as
+        # a JSON schema; surface it on the gate payload under editable_input_schema
+        # (the SAME key the LT-4 retry form already consumes from failure_envelope)
+        # so the frontend gets a real schema (enum/bounds/title) for the gate's
+        # controls instead of only the type-inferred gate_envelope controls. Absent
+        # (adapter-less gate or nothing adjustable) -> key omitted, zero change.
+        editable_schema = gate_editable_input_schema(
+            plan,
+            gate,
+            lambda step_id: self._safe_plan_step_output(plan, step_id),
+        )
+        if editable_schema:
+            meta["editable_input_schema"] = editable_schema
+        meta["gate_envelope"] = extract_gate_envelope({"metadata": meta}).to_dict()
+        return DriverMessage("gate", "\n\n".join(parts), meta)
+
+    def done_message(self, plan: Plan, *, run_seq) -> DriverMessage:
+        terminal = max(
+            (
+                step
+                for step in plan.steps
+                if step.status == StepStatus.DONE and step.output_ref
+            ),
+            key=lambda step: step.index,
+            default=None,
+        )
+        parts = ["✅ The plan has been fully completed."]
+        tables: list[dict] = []
+        output = None
+        if terminal is not None:
+            output = self._safe_step_output(terminal, plan=plan)
+            if output is not None:
+                text, tables = self._render_step_output(
+                    plan,
+                    terminal,
+                    output,
+                )
+                if text:
+                    parts.append(text)
+        meta = {"plan_id": plan.id, "run_seq": run_seq, "tables": tables}
+        result_dataset = self.latest_result_dataset_metadata(plan)
+        if result_dataset is not None:
+            meta["result_dataset"] = result_dataset
+        report_details = self._latest_report_details(plan)
+        if report_details is not None:
+            report_step, report_output = report_details
+            self._attach_report_download_metadata(
+                meta,
+                plan=plan,
+                report_step=report_step,
+                report_output=report_output,
+            )
+        if terminal is not None and output is not None:
+            if terminal.tool_ref.tool == "generate_risk_analysis_report":
+                # Keep a bounded, deterministic envelope for governed memory
+                # capture. Raw rows never enter conversation metadata.
+                allowed = (
+                    "analysis_kind",
+                    "product_scope",
+                    "as_of_period",
+                    "report_path",
+                    "headline_metrics",
+                    "key_points",
+                    "red_flags",
+                    "assumptions",
+                    "source_row_count",
+                    "row_count",
+                    "column_map",
+                )
+                meta["risk_analysis_report"] = {
+                    key: output[key] for key in allowed if key in output
+                }
+            report_output, report_step = self._report_dependency_output(plan, terminal)
+            delivery = build_model_delivery_payload(
+                output,
+                terminal,
+                report_output=report_output,
+                report_step=report_step,
+            )
+            if delivery is not None:
+                meta["model_delivery"] = delivery
+        return DriverMessage("done", "\n\n".join(parts), meta)
+
+    def latest_result_dataset_id(self, plan: Plan) -> str | None:
+        """Return the newest materialized dataset produced by a completed plan.
+
+        Kept public so the message API can enrich historical completion messages
+        that predate the ``result_dataset`` metadata contract without rewriting
+        the persisted audit transcript.
+        """
+        details = self._latest_result_dataset_details(plan)
+        return details[1] if details is not None else None
+
+    def latest_result_dataset_metadata(self, plan: Plan) -> dict[str, str] | None:
+        """Return a task-scoped download contract with workflow-specific copy."""
+        details = self._latest_result_dataset_details(plan)
+        if details is None:
+            return None
+        step, dataset_id, content_hash = details
+        title, download_label = _RESULT_DATASET_PRESENTATION_BY_TOOL.get(
+            step.tool_ref.tool,
+            _DEFAULT_RESULT_DATASET_PRESENTATION,
+        )
+        query = urlencode(
+            {
+                "plan_id": plan.id,
+                "step_id": step.id,
+                "output_ref": step.output_ref,
+                "expected_content_hash": content_hash,
+            }
+        )
+        return {
+            "dataset_id": dataset_id,
+            "download_url": (
+                f"/api/tasks/{quote(str(plan.task_id), safe='')}/datasets/"
+                f"{quote(dataset_id, safe='')}/download?{query}"
+            ),
+            "plan_id": str(plan.id),
+            "step_id": str(step.id),
+            "output_ref": str(step.output_ref),
+            "content_hash": content_hash,
+            "title": title,
+            "download_label": download_label,
+        }
+
+    def _latest_result_dataset_details(
+        self,
+        plan: Plan,
+    ) -> tuple[PlanStep, str, str] | None:
+        for step in sorted(plan.steps, key=lambda item: item.index, reverse=True):
+            if step.status != StepStatus.DONE or not step.output_ref:
+                continue
+            output = self._safe_step_output(step, plan=plan)
+            if not isinstance(output, dict):
+                continue
+            dataset_binding = self._trusted_result_dataset_binding(
+                plan,
+                step,
+                output,
+            )
+            if dataset_binding:
+                return step, *dataset_binding
+        return None
+
+    def _trusted_result_dataset_binding(
+        self,
+        plan: Plan,
+        step: PlanStep,
+        output: Mapping[str, Any],
+    ) -> tuple[str, str] | None:
+        if (
+            self._load_dataset is None
+            or self._resolve_verified_dataset_path is None
+        ):
+            return None
+        dataset_id = str(output.get("result_dataset_id") or "").strip()
+        if not dataset_id:
+            return None
+        evidence = self._trusted_step_evidence(step, plan=plan)
+        if not isinstance(evidence, Mapping):
+            return None
+        if (
+            evidence.get("renderer_hint") != step.tool_ref.tool
+            or not isinstance(evidence.get("step_run_id"), str)
+            or not evidence.get("step_run_id")
+            or not isinstance(evidence.get("input_hash"), str)
+        ):
+            return None
+        bindings = evidence.get("result_dataset_bindings")
+        if not isinstance(bindings, list):
+            return None
+        binding = next(
+            (
+                item
+                for item in bindings
+                if isinstance(item, Mapping)
+                and item.get("dataset_id") == dataset_id
+            ),
+            None,
+        )
+        if not isinstance(binding, Mapping):
+            return None
+        expected_hash = binding.get("content_hash")
+        if (
+            not isinstance(expected_hash, str)
+            or len(expected_hash) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_hash
+            )
+        ):
+            return None
+        try:
+            dataset = self._load_dataset(dataset_id)
+            verified_path = self._resolve_verified_dataset_path(dataset_id)
+        except (DataLayerError, KeyError, OSError, TypeError, ValueError):
+            return None
+        if (
+            dataset is None
+            or str(getattr(dataset, "id", "")) != dataset_id
+            or str(getattr(dataset, "task_id", "")) != str(plan.task_id)
+            or str(getattr(dataset, "content_hash", "")) != expected_hash
+            or verified_path is None
+        ):
+            return None
+        return dataset_id, expected_hash
+
+    def latest_report(self, plan: Plan) -> tuple[str, str] | None:
+        """Return the newest generated report so completion messages can expose
+        the download exactly where the result is presented, independent of rail
+        polling or viewport position."""
+        details = self._latest_report_details(plan)
+        if details is None:
+            return None
+        step, output = details
+        return str(step.tool_ref.tool), str(output.get("report_path") or "")
+
+    def _latest_report_details(self, plan: Plan) -> tuple[PlanStep, dict] | None:
+        for step in sorted(plan.steps, key=lambda item: item.index, reverse=True):
+            if step.status != StepStatus.DONE or not step.output_ref:
+                continue
+            output = self._safe_step_output(step, plan=plan)
+            report_path = (
+                str(output.get("report_path") or "") if isinstance(output, dict) else ""
+            )
+            if report_path:
+                return step, output
+        return None
+
+    def _attach_report_download_metadata(
+        self,
+        meta: dict,
+        *,
+        plan: Plan,
+        report_step: PlanStep | None,
+        report_output: dict | None,
+    ) -> None:
+        if report_step is None or not isinstance(report_output, dict):
+            return
+        report_labels = {
+            "generate_feature_report": "Download feature analysis",
+            "generate_risk_analysis_report": "Download risk analysis reports",
+            "portfolio_report": "Download the portfolio analysis report",
+        }
+        label = report_labels.get(
+            report_step.tool_ref.tool,
+            "Download Model Development Report",
+        )
+        reports = driver_report_download_metadata(
+            plan_id=plan.id,
+            task_id=plan.task_id,
+            step_id=report_step.id,
+            output=report_output,
+            default_label=label,
+        )
+        if not reports:
+            return
+        if isinstance(report_output.get("reports"), list):
+            meta["report_downloads"] = reports
+            meta["report_download"] = reports[0]
+            return
+        # Preserve the original single-report endpoint and payload contract.
+        meta["report_download"] = {
+            "label": label,
+            "download_url": f"/api/tasks/{plan.task_id}/driver-report/download",
+        }
+
+    def review_message(self, plan: Plan, *, run_seq) -> DriverMessage:
+        return DriverMessage(
+            "review",
+            "The plan has been implemented, but the results will require a review and a final conclusion.",
+            {"plan_id": plan.id, "run_seq": run_seq},
+        )
+
+    def cancelled_message(self, plan: Plan, *, run_seq) -> DriverMessage:
+        interrupted = next(
+            (step for step in plan.steps if step.status == StepStatus.FAILED),
+            None,
+        )
+        detail = (
+            f"({interrupted.title})Stopped;"
+            if interrupted is not None
+            else "(a) The current implementation has been discontinued;"
+        )
+        return DriverMessage(
+            "chat",
+            detail
+            + "The completed steps, intermediate results, points of reference and final progress have been retained."
+            + "If you need to resume, enter \" Continue with the current steps \" .",
+            {
+                "plan_id": plan.id,
+                "step_id": interrupted.id if interrupted is not None else None,
+                "run_seq": run_seq,
+                "intent": "execution_cancelled",
+                "cancelled": True,
+            },
+        )
+
+    def instruction_message(
+        self, plan: Plan, gate: PlanStep | None, *, run_seq, text: str
+    ) -> DriverMessage:
+        return DriverMessage(
+            "gate",
+            text,
+            {
+                "plan_id": plan.id,
+                "step_id": gate.id if gate else None,
+                "run_seq": run_seq,
+                "confirmation_snapshot": self._confirmation_snapshot(plan, gate),
+            },
+        )
+
+    def _confirmation_snapshot(
+        self,
+        plan: Plan,
+        step: PlanStep | None = None,
+    ) -> dict[str, object]:
+        """Freeze the persisted snapshot, including DB-assigned timestamps."""
+
+        live_plan = plan
+        repository = self._plan_repository
+        load_plan = getattr(repository, "load_plan", None)
+        if callable(load_plan):
+            try:
+                live_plan = load_plan(plan.id)
+            except Exception:
+                # The composer is also used with in-memory/fake repositories in
+                # tests. Falling back remains safe because the eventual CAS is
+                # authoritative and rejects a mismatched token.
+                live_plan = plan
+        live_step = None
+        if step is not None:
+            live_step = next(
+                (item for item in live_plan.steps if item.id == step.id),
+                step,
+            )
+        snapshot: dict[str, object] = {
+            "expected_plan_status": live_plan.status.value,
+            "expected_plan_revision": int(live_plan.replan_count),
+            "expected_plan_fingerprint": plan_fingerprint(live_plan),
+        }
+        if live_step is not None:
+            is_confirmed = getattr(repository, "is_step_confirmed", None)
+            confirmed = bool(is_confirmed(live_step.id)) if callable(is_confirmed) else False
+            snapshot["expected_step_fingerprint"] = (
+                plan_step_confirmation_fingerprint(
+                    live_step,
+                    confirmed=confirmed,
+                )
+            )
+        return snapshot
+
+    def manual_adjust_placeholder_message(
+        self,
+        plan: Plan,
+        gate: PlanStep | None,
+        *,
+        run_seq,
+    ) -> DriverMessage:
+        return self.instruction_message(
+            plan,
+            gate,
+            run_seq=run_seq,
+            text="Copy that. Please continue with the confirmation.",
+        )
+
+    def failed_message(self, plan: Plan, *, run_seq) -> DriverMessage:
+        failed = next(
+            (step for step in plan.steps if step.status == StepStatus.FAILED), None
+        )
+        detail = (
+            f"[{failed.title}]Failed:{failed.error}"
+            if failed and failed.error
+            else "Implementation interrupted."
+        )
+        meta = {
+            "plan_id": plan.id,
+            "step_id": failed.id if failed else None,
+            "run_seq": run_seq,
+        }
+        reset_steps: tuple[str, ...] = ()
+        error_kind = "execution"
+        if failed is not None:
+            downstream = downstream_step_ids(plan, [failed.id])
+            reset_steps = tuple(
+                step.id
+                for step in sorted(plan.steps, key=lambda item: (item.index, item.id))
+                if step.id == failed.id or step.id in downstream
+            )
+            if self._latest_failed_step_run_error_kind is not None:
+                error_kind = (
+                    self._latest_failed_step_run_error_kind(failed.id) or error_kind
+                )
+        meta["failure_envelope"] = build_failure_envelope(
+            plan_id=plan.id,
+            step_id=failed.id if failed else None,
+            run_seq=run_seq,
+            message=detail,
+            step_inputs=failed.inputs if failed else None,
+            downstream_reset_steps=reset_steps,
+            error_kind=error_kind,
+            retryable=failed is not None,
+        ).to_dict()
+        diagnostic = _step_failure_diagnostic(failed, detail, error_kind)
+        meta["error"] = True
+        meta["error_diagnostic"] = diagnostic
+        return DriverMessage(
+            "error",
+            f"❌ {detail}\n\nThe steps that have been completed and the intermediate results are retained.Agent Continue with the current failed steps?",
+            meta,
+        )
+
+    def _report_dependency_output(
+        self, plan: Plan, step: PlanStep
+    ) -> tuple[dict | None, PlanStep | None]:
+        for dep_id in step.depends_on or []:
+            dep = find_step(plan, dep_id)
+            if dep is None or dep.tool_ref.tool not in {
+                "generate_model_report",
+                "generate_model_reports",
+            }:
+                continue
+            output = self._safe_step_output(dep, plan=plan)
+            return (output if isinstance(output, dict) else None), dep
+        return None, None
+
+    def _trusted_terminal_inputs(
+        self,
+        plan: Plan,
+        step: PlanStep,
+    ) -> Mapping[str, Any] | None:
+        """Resolve only PoolStability's exact direct ImpactCube references."""
+
+        if step.tool_ref.tool != "measure_strategy_pool_stability":
+            return step.inputs
+        if not isinstance(step.inputs, Mapping):
+            return None
+        raw = dict(step.inputs)
+        if not any(
+            isinstance(value, str) and value.startswith("$ref:")
+            for value in raw.values()
+        ):
+            return raw
+        if len(step.depends_on) != 1:
+            return None
+        dependency = find_step(plan, step.depends_on[0])
+        if (
+            dependency is None
+            or dependency.status != StepStatus.DONE
+            or dependency.tool_ref.tool != "measure_strategy_impact_cube"
+            or not dependency.output_ref
+        ):
+            return None
+        expected_paths = {
+            "artifact_id": ("artifact", "artifact_id"),
+            "expected_artifact_content_hash": (
+                "artifact",
+                "content_hash",
+            ),
+            "expected_cube_id": ("cube_id",),
+            "expected_cube_content_hash": ("content_hash",),
+        }
+        if set(raw) != set(expected_paths):
+            return None
+        output = self._safe_step_output(dependency, plan=plan)
+        if not isinstance(output, Mapping):
+            return None
+        resolved: dict[str, str] = {}
+        for field, path in expected_paths.items():
+            expected_ref = f"$ref:{dependency.id}.output." + ".".join(path)
+            if raw[field] != expected_ref:
+                return None
+            value: object = output
+            for component in path:
+                if not isinstance(value, Mapping) or component not in value:
+                    return None
+                value = value[component]
+            if not isinstance(value, str) or not value:
+                return None
+            resolved[field] = value
+        return resolved
+
+    def _safe_output(self, step_id: str):
+        try:
+            return self._load_output(step_id)
+        except KeyError:
+            return None
+
+    @staticmethod
+    def _step_output_version(step: PlanStep) -> int | None:
+        output_ref = str(step.output_ref or "")
+        prefix = f"metrics:{step.id}:v"
+        if not output_ref.startswith(prefix):
+            return None
+        raw_version = output_ref.removeprefix(prefix)
+        if not raw_version.isdigit() or int(raw_version) < 1:
+            return None
+        return int(raw_version)
+
+    def _trusted_step_binding(
+        self,
+        plan: Plan | None,
+        step: PlanStep,
+    ) -> dict | None:
+        if self._load_step_presentation_binding is None or plan is None:
+            return None
+        plan_id = str(getattr(plan, "id", "") or "")
+        task_id = str(getattr(plan, "task_id", "") or "")
+        output_ref = str(step.output_ref or "")
+        if not plan_id or not task_id or not output_ref:
+            return None
+        cache_key = (plan_id, step.id, output_ref)
+        if cache_key in self._step_presentation_bindings:
+            return self._step_presentation_bindings[cache_key]
+        try:
+            binding = self._load_step_presentation_binding(step.id, output_ref)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (
+            not isinstance(binding, Mapping)
+            or binding.get("plan_id") != plan_id
+            or binding.get("task_id") != task_id
+            or binding.get("step_id") != step.id
+            or binding.get("output_ref") != output_ref
+            or not isinstance(binding.get("output"), Mapping)
+            or not isinstance(binding.get("evidence"), Mapping)
+            or not isinstance(binding.get("inputs"), Mapping)
+        ):
+            return None
+        trusted = {
+            **dict(binding),
+            "output": dict(binding["output"]),
+            "evidence": dict(binding["evidence"]),
+            "inputs": dict(binding["inputs"]),
+        }
+        self._step_presentation_bindings[cache_key] = trusted
+        return trusted
+
+    def _safe_step_output(
+        self,
+        step: PlanStep,
+        *,
+        plan: Plan | None = None,
+    ):
+        if self._load_step_presentation_binding is not None:
+            binding = self._trusted_step_binding(plan, step)
+            return None if binding is None else binding["output"]
+        version = self._step_output_version(step)
+        if version is None or self._load_step_evidence is None:
+            return self._safe_output(step.id)
+        try:
+            return self._load_output(step.id, version=version)
+        except (KeyError, TypeError):
+            return None
+
+    def _safe_plan_step_output(self, plan: Plan, step_id: str):
+        step = find_step(plan, step_id)
+        return (
+            None
+            if step is None
+            else self._safe_step_output(step, plan=plan)
+        )
+
+    def _trusted_step_evidence(
+        self,
+        step: PlanStep,
+        *,
+        plan: Plan | None = None,
+    ) -> dict | None:
+        if self._load_step_presentation_binding is not None:
+            binding = self._trusted_step_binding(plan, step)
+            return None if binding is None else binding["evidence"]
+        version = self._step_output_version(step)
+        if version is None or self._load_step_evidence is None:
+            return None
+        try:
+            evidence = self._load_step_evidence(step.id, version=version)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not isinstance(evidence, Mapping):
+            return None
+        if evidence.get("output_ref") != step.output_ref:
+            return None
+        return dict(evidence)
+
+    def _render_step_output(
+        self,
+        plan: Plan,
+        step: PlanStep,
+        output: object,
+        *,
+        presentation_state: str | None = None,
+    ) -> tuple[str, list[dict]]:
+        """Render one stored result using only plan/repository trust roots."""
+
+        if self._load_step_presentation_binding is not None:
+            trusted_output = self._safe_step_output(step, plan=plan)
+            if trusted_output is None or output != trusted_output:
+                return (
+                    "**Result integrity verification failed**:The current step output is not consistent with the unmovable binding."
+                    "Stopped displaying.",
+                    [],
+                )
+
+        return render_tool_output(
+            step.tool_ref.tool,
+            output,
+            trusted_task_id=plan.task_id,
+            trusted_workspace=self._workspace,
+            trusted_output_ref=step.output_ref,
+            trusted_step_evidence=self._trusted_step_evidence(step, plan=plan),
+            trusted_inputs=self._trusted_presenter_inputs(plan, step),
+            trusted_artifacts=self._trusted_terminal_artifacts(
+                plan.task_id,
+                step,
+                output,
+            ),
+            presentation_state=presentation_state,
+        )
+
+    def _trusted_presenter_inputs(
+        self,
+        plan: Plan,
+        step: PlanStep,
+    ) -> Mapping[str, Any] | None:
+        binding = self._trusted_step_binding(plan, step)
+        if binding is not None:
+            return binding["inputs"]
+        return self._trusted_terminal_inputs(plan, step)
+
+    def _trusted_delivery_artifacts(
+        self,
+        task_id: str,
+        step: PlanStep,
+        output: object,
+    ) -> dict[str, dict] | None:
+        if (
+            step.tool_ref.tool != "export_strategy_delivery"
+            or self._load_task_artifact is None
+            or not isinstance(output, Mapping)
+        ):
+            return None
+        artifacts = output.get("artifacts")
+        names = ("python", "sql", "strategy_json", "equivalence_json")
+        if not isinstance(artifacts, list) or len(artifacts) != len(names):
+            return None
+        trusted: dict[str, dict] = {}
+        for name, artifact in zip(names, artifacts, strict=True):
+            if not isinstance(artifact, Mapping):
+                return None
+            artifact_id = artifact.get("artifact_id")
+            if not isinstance(artifact_id, str) or not artifact_id:
+                return None
+            try:
+                record = self._load_task_artifact(task_id, artifact_id)
+            except (KeyError, TypeError, ValueError):
+                return None
+            if not isinstance(record, Mapping):
+                return None
+            trusted[name] = dict(record)
+        return trusted
+
+    def _trusted_terminal_artifacts(
+        self,
+        task_id: str,
+        step: PlanStep,
+        output: object,
+    ) -> dict[str, dict] | None:
+        if step.tool_ref.tool == "measure_candidate_monthly_stability":
+            return self._trusted_candidate_stability_artifact(
+                task_id,
+                output,
+            )
+        if step.tool_ref.tool == "measure_strategy_pool_validation":
+            return self._trusted_pool_validation_artifact(
+                task_id,
+                output,
+            )
+        if step.tool_ref.tool == "measure_strategy_pool_stability":
+            return self._trusted_pool_stability_artifact(
+                task_id,
+                output,
+            )
+        if step.tool_ref.tool == "measure_strategy_impact_cube":
+            return self._trusted_impact_cube_artifact(task_id, output)
+        return self._trusted_delivery_artifacts(task_id, step, output)
+
+    def _trusted_impact_cube_artifact(
+        self,
+        task_id: str,
+        output: object,
+    ) -> dict[str, dict] | None:
+        if self._load_task_artifact is None or not isinstance(output, Mapping):
+            return None
+        artifact = output.get("artifact")
+        if not isinstance(artifact, Mapping):
+            return None
+        artifact_id = artifact.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            return None
+        try:
+            record = self._load_task_artifact(task_id, artifact_id)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not isinstance(record, Mapping):
+            return None
+        return {"impact_cube": {"record": dict(record)}}
+
+    def _trusted_pool_stability_artifact(
+        self,
+        task_id: str,
+        output: object,
+    ) -> dict[str, dict] | None:
+        if (
+            self._load_task_artifact is None
+            or self._tasks_root is None
+            or self._db_path is None
+            or not isinstance(output, Mapping)
+        ):
+            return None
+        artifact = output.get("artifact")
+        if not isinstance(artifact, Mapping):
+            return None
+        artifact_id = artifact.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            return None
+        try:
+            record = self._load_task_artifact(task_id, artifact_id)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not isinstance(record, Mapping):
+            return None
+        return {
+            "pool_stability": {
+                "record": dict(record),
+                "tasks_root": str(self._tasks_root),
+                "db_path": str(self._db_path),
+            }
+        }
+
+    def _trusted_pool_validation_artifact(
+        self,
+        task_id: str,
+        output: object,
+    ) -> dict[str, dict] | None:
+        if (
+            self._load_task_artifact is None
+            or self._tasks_root is None
+            or not isinstance(output, Mapping)
+        ):
+            return None
+        artifact = output.get("artifact")
+        if not isinstance(artifact, Mapping):
+            return None
+        artifact_id = artifact.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            return None
+        try:
+            record = self._load_task_artifact(task_id, artifact_id)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not isinstance(record, Mapping):
+            return None
+        return {
+            "pool_validation": {
+                "record": dict(record),
+                "tasks_root": str(self._tasks_root),
+            }
+        }
+
+    def _trusted_candidate_stability_artifact(
+        self,
+        task_id: str,
+        output: object,
+    ) -> dict[str, dict] | None:
+        if self._load_task_artifact is None or not isinstance(output, Mapping):
+            return None
+        artifacts = output.get("artifacts")
+        if not isinstance(artifacts, list) or len(artifacts) != 1:
+            return None
+        artifact = artifacts[0]
+        if not isinstance(artifact, Mapping):
+            return None
+        artifact_id = artifact.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            return None
+        try:
+            record = self._load_task_artifact(task_id, artifact_id)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not isinstance(record, Mapping):
+            return None
+        return {"stability": dict(record)}
+
+
+__all__ = ["PlanMessageComposer"]
+
+
+def _step_failure_diagnostic(
+    failed: PlanStep | None, detail: str, error_kind: str
+) -> dict:
+    raw_error = str(failed.error or "") if failed is not None else ""
+    lowered = raw_error.lower()
+    if "'type' object is not subscriptable" in lowered:
+        cause = (
+            "Old version of the tool processPython Compatibility error when importing new type notes;"
+            "This is not a question of the data content or the rules of the fusion itself."
+        )
+    else:
+        cause = raw_error or "The current steps reverted to implementation errors and subsequent relying steps were suspended."
+    step_title = failed.title if failed is not None else "Current steps"
+    diagnostic = {
+        "schema_version": "workflow_error.v1",
+        "workflow": "plan_driver",
+        "code": "workflow_step_failed",
+        "phase": "execution",
+        "title": "Step implementation failed",
+        "summary": f"[{step_title}]Not completed; completed steps and intermediate results retained.",
+        "cause": cause,
+        "location": step_title,
+        "evidence": [{"label": "Error Type", "value": str(error_kind or "execution")}],
+        "actions": [
+            "ByAgent Retrying from the current failure steps does not run back to the completed steps.",
+            "If the input parameter needs to be adjusted, you can retry the editing in the failed step card of the intermediate stream.",
+            "If retrying fails, preserve existing evidence and allowAgent Re-program the next steps.",
+        ],
+        "agent_prompt": "Whether or not theAgent Try again from the current failed step?",
+        "recovery_actions": [
+            {"label": "ByAgent Retry current steps", "command": "Retry current steps"},
+        ],
+        "technical_detail": detail,
+        "retryable": failed is not None,
+        "impact": "The dependency steps following the failed steps have not yet been implemented.",
+    }
+    from marvis.agent.workflow_error_diagnostics import (  # noqa: PLC0415
+        enrich_workflow_error_diagnostic,
+    )
+
+    return enrich_workflow_error_diagnostic(diagnostic)
