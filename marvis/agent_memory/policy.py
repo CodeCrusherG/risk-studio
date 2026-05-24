@@ -1,0 +1,192 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
+import re
+from typing import Any
+
+from marvis.agent_memory.models import RISK_ANALYSIS_EXPERIENCE_FIELDS, MemoryCandidate
+
+
+@dataclass(frozen=True)
+class MemoryPolicyDecision:
+    allowed: bool
+    reasons: list[str]
+
+
+CUSTOMER_DETAIL_PATTERNS = (
+    re.compile(r"(?:Client number|ID card|Cell phone number|phone|mobile)\s*[::=]?\s*[0-9A-Za-z_* -]{6,}"),
+    re.compile(r"\b1[3-9]\d{9}\b"),
+)
+CUSTOMER_IDENTIFIER_FIELD_PATTERNS = (
+    re.compile(
+        r"\b(?:customer|cust|client|user)[ _-]?(?:id|no|number)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:mobile|phone|id[ _-]?card)\b", re.IGNORECASE),
+    re.compile(r"(?:Client number|Client number|User ID|Cell phone number|ID number?)"),
+)
+RAW_SAMPLE_ROW_PATTERNS = (
+    re.compile(
+        r"\b(?:raw\s+row|sample\s+row|Sample Line|Original sample)\b.*\b(?:score|y|target|apply_month)\s*=",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:age|score|target|y|apply_month|channel)\s*=\s*[^,\s]+.*\b(?:age|score|target|y|apply_month|channel)\s*=",
+        re.IGNORECASE,
+    ),
+)
+NOTEBOOK_SOURCE_PATTERNS = (
+    re.compile(r"```(?:python|py|ipython)?\s", re.IGNORECASE),
+    re.compile(r"\bimport\s+pandas\b"),
+    re.compile(r"\bpd\.read_(?:csv|excel|feather|parquet)\b"),
+)
+PMML_OR_MODEL_PATTERNS = (
+    re.compile(r"<\s*PMML\b", re.IGNORECASE),
+    re.compile(r"<\s*(?:MiningModel|RegressionModel|TreeModel|NeuralNetwork)\b", re.IGNORECASE),
+    re.compile(r"\b(?:pickle|joblib|model_file|pmml file content)\b", re.IGNORECASE),
+)
+PAYLOAD_FIELD_ALLOWLISTS = {
+    "user_preference": frozenset({"preference"}),
+    "field_convention": frozenset({
+        "field",
+        "meaning",
+        "target_col",
+        "score_col",
+        "split_col",
+        "time_col",
+        "channel_col",
+    }),
+    "validation_pitfall": frozenset({"failure_kind", "message"}),
+    "task_experience": frozenset({"status", "failure_type", "package"}),
+    "model_experience": frozenset({
+        "ks",
+        "auc",
+        "psi",
+        "month",
+        "channel",
+        "model_name",
+        "model_version",
+        "scope",
+        "source_task_id",
+        "important_feature_sources",
+        "overfitting_status",
+        "head_lift_5pct",
+        "tail_lift_5pct",
+    }),
+    "feature_experience": frozenset({
+        "feature_count",
+        "recommended_features",
+        "avoid_features",
+        "recommendation_confidence",
+        "recommendation_evidence",
+        "target_col",
+        "scope",
+        "source_task_id",
+    }),
+    "join_experience": frozenset({
+        "match_rate",
+        "anchor_rows",
+        "joined_rows",
+        "feature_table_count",
+        "scope",
+        "source_task_id",
+    }),
+    "strategy_experience": frozenset({
+        "strategy_type",
+        "cutoff_summary",
+        "approval_rate",
+        "approved_bad_rate",
+        "expected_profit",
+        "scope",
+        "source_task_id",
+    }),
+    "risk_analysis_experience": frozenset(RISK_ANALYSIS_EXPERIENCE_FIELDS),
+    "skill_experience_reserved": frozenset(),
+}
+SECRET_PATTERNS = (
+    re.compile(r"\b(?:api[_-]?key|secret|token)\s*[:=]\s*[A-Za-z0-9_\-]{8,}", re.IGNORECASE),
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}\b"),
+)
+DB_CONNECTION_PATTERNS = (
+    re.compile(r"\b(?:postgresql|mysql|oracle|sqlite|mongodb)://", re.IGNORECASE),
+    re.compile(r"\b(?:jdbc|odbc):", re.IGNORECASE),
+)
+ABSOLUTE_LOCAL_PATH_PATTERNS = (
+    re.compile(
+        r"(?<![:/])/(?:Users|home|tmp|private|var|Volumes|mnt|workspace)"
+        r"(?:/[^\s\"'{}]+)+"
+    ),
+    re.compile(r"\b[A-Za-z]:\\+(?:[^\\\s\"]+\\+)*[^\\\s\"]+"),
+)
+MEMORY_CANDIDATE_TEXT_MAX_CHARS = 12000
+
+
+def classify_memory_candidate(candidate: MemoryCandidate) -> MemoryPolicyDecision:
+    text = _candidate_text(candidate)
+    reasons = _forbidden_text_reasons(text)
+
+    if candidate.memory_type == "risk_analysis_experience":
+        if any(pattern.search(text) for pattern in CUSTOMER_IDENTIFIER_FIELD_PATTERNS):
+            reasons.append("customer identifier field")
+        if any(pattern.search(text) for pattern in ABSOLUTE_LOCAL_PATH_PATTERNS):
+            reasons.append("absolute local path")
+
+    if not reasons and _unsupported_payload_fields(candidate):
+        reasons.append("unsupported payload fields")
+
+    return MemoryPolicyDecision(allowed=not reasons, reasons=reasons)
+
+
+def classify_distillation_payload(summary: str, structured: dict[str, Any]) -> MemoryPolicyDecision:
+    text = f"{summary}\n{_json_text(structured)}"
+    reasons = _forbidden_text_reasons(text)
+    return MemoryPolicyDecision(allowed=not reasons, reasons=reasons)
+
+
+def _forbidden_text_reasons(text: str) -> list[str]:
+    reasons: list[str] = []
+
+    if any(pattern.search(text) for pattern in CUSTOMER_DETAIL_PATTERNS):
+        reasons.append("customer detail")
+    if any(pattern.search(text) for pattern in RAW_SAMPLE_ROW_PATTERNS):
+        reasons.append("raw sample row")
+    if any(pattern.search(text) for pattern in NOTEBOOK_SOURCE_PATTERNS):
+        reasons.append("notebook source")
+    if any(pattern.search(text) for pattern in PMML_OR_MODEL_PATTERNS):
+        reasons.append("pmml or model content")
+    if any(pattern.search(text) for pattern in SECRET_PATTERNS):
+        reasons.append("secret")
+    if any(pattern.search(text) for pattern in DB_CONNECTION_PATTERNS):
+        reasons.append("database connection")
+    if _looks_like_long_report_text(text):
+        reasons.append("long report text")
+    if len(text) > MEMORY_CANDIDATE_TEXT_MAX_CHARS:
+        reasons.append("memory text too long")
+    return reasons
+
+
+def _candidate_text(candidate: MemoryCandidate) -> str:
+    return f"{candidate.summary}\n{_json_text(candidate.payload)}"
+
+
+def _unsupported_payload_fields(candidate: MemoryCandidate) -> set[str]:
+    allowed = PAYLOAD_FIELD_ALLOWLISTS.get(candidate.memory_type)
+    if allowed is None:
+        return set(candidate.payload)
+    return set(candidate.payload) - set(allowed)
+
+
+def _json_text(value: dict[str, Any]) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        return str(value)
+
+
+def _looks_like_long_report_text(text: str) -> bool:
+    text = str(text or "")
+    if len(text) < 300:
+        return False
+    report_markers = ("Model validation report", "Full report", "Present report", "Validation report")
+    return any(marker in text for marker in report_markers)
