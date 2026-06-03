@@ -1,0 +1,1303 @@
+from pathlib import Path
+
+from fastapi import APIRouter, BackgroundTasks, Request
+from marvis.errors import conflict, unprocessable
+
+from marvis.agent.service import (
+    agent_rerun_stage,
+    answer_chat_message,
+    is_agent_advance_intent,
+    is_agent_material_reselection_intent,
+    is_agent_report_revision_intent,
+    is_continue_validation_intent,
+    is_stop_validation_intent,
+    summarize_stage,
+)
+from marvis.agent.plan_message_composer import PlanMessageComposer
+from marvis.agent.plan_driver import confirmation_is_explicitly_withheld, is_confirm
+from marvis.agent.workflow_error_diagnostics import (
+    enrich_workflow_error_diagnostic,
+    failure_envelope_for_diagnostic,
+)
+from marvis.agent.strategy_setup import strategy_development_clarification
+from marvis.agent.turn_handlers import (
+    DRIVER_AGENT_TASK_TYPES,
+    is_labeling_deterministic_turn,
+    is_portfolio_deterministic_turn,
+)
+from marvis.agent.validation_app_service import (
+    WIRED_AGENT_TASK_TYPES,
+    add_and_stream_agent_message,
+    agent_chat_evidence,
+    agent_evidence,
+    agent_memory_context,
+    audit_agent_memory_use,
+    capture_user_preference_memory,
+    confirm_agent_report_conclusions,
+    dispatch_agent_validation_job,
+    dispatch_driver_turn,
+    generate_word_conclusions,
+    handle_agent_stop_message,
+    is_agent_report_confirm_intent,
+    is_agent_report_regenerate_intent,
+    latest_pending_agent_report_draft,
+    latest_report_draft_context,
+    model_metadata,
+    repo as agent_repo,
+    require_agent_task,
+    require_wired_agent_task_type,
+    resolve_agent_model,
+    resolve_driver_agent_client,
+    review_validation_semantic_authorization,
+)
+from marvis.agent.validation_messages import format_conclusion_values
+from marvis.agent.validation_service import (
+    require_agent_rerun_stage_reached,
+    reset_agent_task_for_rerun,
+)
+from marvis.api_schemas import (
+    AgentMessageRequest,
+    AgentModelRequest,
+    AgentReportDraftConfirmRequest,
+    AgentReportDraftSaveRequest,
+    StrategyTaskInputRequest,
+)
+from marvis.api_task_helpers import get_task_or_404, reject_if_task_has_active_job
+from marvis.data.backend import DataBackend
+from marvis.data.registry import DatasetRegistry
+from marvis.domain import (
+    TASK_TYPE_DATA_JOIN,
+    TASK_TYPE_PORTFOLIO,
+    TASK_TYPE_STRATEGY,
+    TASK_TYPE_VALIDATION,
+    TASK_TYPE_VALIDATION_BATCH,
+    TASK_TYPE_VINTAGE,
+    StrategyProfitInput,
+    StrategyTaskInput,
+)
+from marvis.orchestrator.contracts import PlanStatus, StepStatus
+from marvis.repositories.datasets import DatasetRepository
+from marvis.repositories.task_artifacts import TaskArtifactRepository
+from marvis.state_machine import ConflictError
+from marvis.validation.suggested_confirmation import confirm_unambiguous_batch_contracts
+from marvis.validation_report_copy import (
+    METRIC_REWRITE_REFUSAL,
+    looks_like_accept_suggested_contracts,
+    looks_like_metric_rewrite_request,
+)
+
+
+router = APIRouter(prefix="/api", tags=["validation-agent"])
+REPORT_DIRECTIVE_LIMIT = 6
+REPORT_DIRECTIVE_CHARS = 1_600
+
+
+def _plan_message_composer(request: Request) -> PlanMessageComposer:
+    """Build historical/recovery presentation with the same live trust roots."""
+
+    plan_repo = request.app.state.plan_repo
+    db_path = getattr(plan_repo, "db_path", None)
+    if db_path is None:
+        return PlanMessageComposer(load_output=plan_repo.load_step_output)
+    trusted_db_path = Path(db_path).absolute()
+    artifact_repo = TaskArtifactRepository(trusted_db_path)
+    datasets_root = trusted_db_path.parent / "datasets"
+    dataset_registry = DatasetRegistry(
+        DatasetRepository(trusted_db_path),
+        DataBackend(datasets_root),
+        datasets_root,
+    )
+    return PlanMessageComposer(
+        load_output=plan_repo.load_step_output,
+        load_step_evidence=plan_repo.load_step_evidence,
+        load_task_artifact=artifact_repo.get_for_task,
+        load_dataset=dataset_registry.get,
+        resolve_verified_dataset_path=dataset_registry.resolve_verified_path,
+        tasks_root=trusted_db_path.parent / "tasks",
+        db_path=trusted_db_path,
+    )
+
+
+def _domain_strategy_input(
+    contract: StrategyTaskInputRequest | None,
+) -> StrategyTaskInput | None:
+    if contract is None:
+        return None
+    profit = contract.profit
+    domain_profit = (
+        StrategyProfitInput(
+            ead_col=profit.ead_col,
+            pd_col=profit.pd_col,
+            annual_rate=profit.annual_rate,
+            funding_rate=profit.funding_rate,
+            lgd=profit.lgd,
+            operating_cost_per_loan=profit.operating_cost_per_loan,
+            term_months=profit.term_months,
+        )
+        if profit is not None
+        else None
+    )
+    return StrategyTaskInput(
+        entry_mode=contract.entry_mode,
+        strategy_type=contract.strategy_type,
+        objective=contract.objective,
+        max_bad_rate=contract.max_bad_rate,
+        min_approval_rate=contract.min_approval_rate,
+        baseline_strategy_id=contract.baseline_strategy_id,
+        profit=domain_profit,
+    )
+
+
+def _validate_confirmation_snapshot(payload: AgentMessageRequest) -> None:
+    """Reject stale-control surfaces before any driver job or LLM call starts."""
+
+    if payload.ui_action == "confirm_roles":
+        # C1 is a source-file/content-bound pre-plan contract. Its historical
+        # step id is not a PlanDriver confirmation and therefore has no plan
+        # fingerprint; turn_handlers independently re-checks the C1 snapshot.
+        if any(
+            value is not None
+            for value in (
+                payload.expected_plan_id,
+                payload.expected_plan_status,
+                payload.expected_plan_revision,
+                payload.expected_plan_fingerprint,
+                payload.expected_step_fingerprint,
+            )
+        ):
+            raise conflict("confirm_roles does not accept plan confirmation tokens")
+        return
+
+    plan_snapshot = (
+        payload.expected_plan_status,
+        payload.expected_plan_revision,
+        payload.expected_plan_fingerprint,
+    )
+    has_any_snapshot = any(value is not None for value in plan_snapshot) or (
+        payload.expected_step_fingerprint is not None
+    )
+    if payload.ui_action is None and not has_any_snapshot:
+        # Free text is independently interpreted against the freshly loaded
+        # gate. Legacy expected ids still prevent cross-gate routing; browser
+        # snapshot tokens are mandatory for typed confirm controls below.
+        return
+    has_any_binding = bool(payload.expected_plan_id or payload.expected_step_id)
+    if has_any_snapshot and not has_any_binding:
+        raise conflict(
+            "confirmation snapshot requires expected_plan_id"
+        )
+    if has_any_binding:
+        if not payload.expected_plan_id or any(
+            value is None for value in plan_snapshot
+        ):
+            raise conflict(
+                "plan-bound controls require plan id, status, revision, and fingerprint"
+            )
+        if payload.expected_step_id and payload.expected_step_fingerprint is None:
+            raise conflict(
+                "step-bound controls require expected_step_fingerprint"
+            )
+        if payload.expected_step_fingerprint is not None and not payload.expected_step_id:
+            raise conflict(
+                "expected_step_fingerprint requires expected_step_id"
+            )
+
+    if payload.ui_action == "start_plan" and not payload.expected_plan_id:
+        raise conflict("start_plan requires a rendered plan snapshot")
+    step_actions = {
+        "confirm_dedup",
+        "apply_join_keys",
+        "exclude_join_feature",
+        "confirm_features",
+        "adjust_screen_thresholds",
+        "confirm_feature_binning",
+        "apply_modeling_setup",
+        "confirm_adoption",
+        "confirm_gate",
+    }
+    if payload.ui_action in step_actions and not payload.expected_step_id:
+        raise conflict(
+            f"{payload.ui_action} requires a rendered step snapshot"
+        )
+
+
+def _validate_ui_action_contract(payload: AgentMessageRequest) -> None:
+    """Validate every rendered control as a discriminated command."""
+
+    action = payload.ui_action
+    if action is None:
+        return
+    adjust = payload.adjust_params
+    if action == "confirm_roles":
+        if any(
+            value is not None
+            for value in (payload.selection, payload.dedup_strategies, adjust)
+        ):
+            raise unprocessable("confirm_roles The planned steps to adjust the field are not accepted.")
+        return
+    if action == "start_plan":
+        if payload.expected_step_id is not None or any(
+            value is not None
+            for value in (payload.selection, payload.dedup_strategies, adjust)
+        ):
+            raise unprocessable("start_plan Only the current plan overview can be confirmed.")
+        return
+    if action == "confirm_dedup":
+        if (
+            not payload.dedup_strategies
+            or payload.selection is not None
+            or adjust is not None
+        ):
+            raise unprocessable("confirm_dedup The government has to and can only submit non-empty heavy strategies.")
+        return
+    if action == "apply_join_keys":
+        if (
+            not isinstance(adjust, dict)
+            or set(adjust) != {"key_overrides"}
+            or not isinstance(adjust.get("key_overrides"), dict)
+            or not adjust["key_overrides"]
+            or payload.selection is not None
+            or payload.dedup_strategies is not None
+        ):
+            raise unprocessable("apply_join_keys It must and can only be submitted to non-emptykey_overrides.")
+        return
+    if action == "exclude_join_feature":
+        if (
+            not isinstance(adjust, dict)
+            or set(adjust) != {"exclude_join_feature_id"}
+            or not str(adjust.get("exclude_join_feature_id") or "").strip()
+            or payload.selection is not None
+            or payload.dedup_strategies is not None
+        ):
+            raise unprocessable(
+                "exclude_join_feature Only one graph identifier must be submitted."
+            )
+        return
+    if action == "confirm_features":
+        if (
+            not payload.selection
+            or payload.dedup_strategies is not None
+            or adjust is not None
+        ):
+            raise unprocessable("confirm_features The collection of audited features must and can only be submitted.")
+        return
+    if action == "adjust_screen_thresholds":
+        allowed = {"leakage_ks", "max_missing_rate"}
+        if (
+            not isinstance(adjust, dict)
+            or not adjust
+            or not set(adjust).issubset(allowed)
+            or payload.selection is not None
+            or payload.dedup_strategies is not None
+        ):
+            raise unprocessable("adjust_screen_thresholds Only filter thresholds can be submitted.")
+        return
+    if action == "confirm_feature_binning":
+        if (
+            not isinstance(adjust, dict)
+            or set(adjust) != {"features", "bins"}
+            or payload.selection is not None
+            or payload.dedup_strategies is not None
+        ):
+            raise unprocessable("confirm_feature_binning Must submitfeatures andbins.")
+        return
+    if action == "apply_modeling_setup":
+        allowed = {
+            "target_type",
+            "recipes",
+            "n_trials",
+            "sample_weight_col",
+            "split_config",
+        }
+        if (
+            not isinstance(adjust, dict)
+            or not adjust
+            or not set(adjust).issubset(allowed)
+            or payload.selection is not None
+            or payload.dedup_strategies is not None
+        ):
+            raise unprocessable("apply_modeling_setup Only model specifications can be submitted.")
+        return
+    if action == "confirm_adoption":
+        if (
+            not isinstance(adjust, dict)
+            or set(adjust) != {"adoption_reason"}
+            or not str(adjust.get("adoption_reason") or "").strip()
+            or payload.selection is not None
+            or payload.dedup_strategies is not None
+        ):
+            raise unprocessable("confirm_adoption Reasons for acceptance must and can only be submitted.")
+        return
+    if action == "confirm_gate":
+        if payload.dedup_strategies is not None or payload.selection is not None:
+            raise unprocessable("confirm_gate No heavy strategy or feature collection is accepted.")
+        if adjust is not None and set(adjust) not in (
+            {"decisions"},
+            {"selected_experiment_id"},
+        ):
+            raise unprocessable("confirm_gate . The structure field does not match the current action.")
+
+
+def _report_revision_instruction_context(
+    conversation: list[dict],
+    current_instruction: str,
+) -> tuple[str, int]:
+    prior: list[str] = []
+    for message in conversation:
+        if message.get("role") != "user":
+            continue
+        content = str(message.get("content") or "").strip()
+        metadata = message.get("metadata") or {}
+        is_word_rerun = metadata.get(
+            "target_stage"
+        ) == "word_conclusion_draft" and metadata.get("intent") in {
+            "rerun_stage",
+            "regenerate_report_draft",
+        }
+        if not content or not (
+            is_word_rerun or is_agent_report_revision_intent(content)
+        ):
+            continue
+        prior.append(content[:REPORT_DIRECTIVE_CHARS])
+    prior = prior[-(REPORT_DIRECTIVE_LIMIT - 1) :]
+    if not prior:
+        return current_instruction, 1
+    directives = [*prior, current_instruction[:REPORT_DIRECTIVE_CHARS]]
+    lines = "\n".join(
+        f"{index}. {directive}" for index, directive in enumerate(directives, 1)
+    )
+    return (
+        "The following are the changes to the instructions in the reports recorded in chronological order of this task; the instructions that followed covered the old ones that conflicted with them:"
+        "The remaining requirements remain valid:\n"
+        f"{lines}",
+        len(directives),
+    )
+
+
+@router.get("/tasks/{task_id}/agent/messages")
+def get_agent_messages(
+    task_id: str,
+    request: Request,
+    after_id: str | None = None,
+    limit: int | None = None,
+) -> dict:
+    repo = agent_repo(request)
+    get_task_or_404(repo, task_id)
+    bounded_limit = None if limit is None else max(1, min(int(limit), 500))
+    cursor_found = bool(after_id and repo.has_agent_message(task_id, after_id))
+    query_limit = bounded_limit + 1 if bounded_limit is not None else None
+    messages = repo.list_agent_messages(task_id, after_id=after_id, limit=query_limit)
+    _enrich_historical_result_download(request, task_id, messages)
+    _enrich_historical_workflow_errors(messages)
+    _enrich_current_plan_gate(request, task_id, messages)
+    has_more = False
+    if bounded_limit is not None and len(messages) > bounded_limit:
+        has_more = True
+        messages = messages[:bounded_limit]
+    return {
+        "messages": messages,
+        "incremental": cursor_found,
+        "has_more": has_more,
+        "limit": bounded_limit,
+    }
+
+
+def _enrich_current_plan_gate(
+    request: Request,
+    task_id: str,
+    messages: list[dict],
+) -> None:
+    """Recover the actionable gate after a raw plan-step retry.
+
+    The editable retry form deliberately uses the plan endpoint so it can
+    replace failed-step inputs. That executor path can stop at the next
+    ``awaiting_confirm`` step without passing through ``PlanDriver``'s message
+    composer, leaving the plan rail healthy but the middle workspace with no
+    gate control. Expose a transient, deterministic gate message on read while
+    keeping the persisted audit transcript unchanged.
+    """
+
+    plans = request.app.state.plan_repo.list_plans_for_task(task_id)
+    if not plans:
+        return
+    plan = plans[-1]
+    if plan.status != PlanStatus.AWAITING_CONFIRM:
+        return
+    gate = next(
+        (
+            step
+            for step in sorted(plan.steps, key=lambda item: (item.index, item.id))
+            if step.status == StepStatus.AWAITING_CONFIRM
+        ),
+        None,
+    )
+    if gate is None:
+        return
+
+    # Check the complete persisted transcript, not only this incremental page.
+    # Otherwise polling with ``after_id=<current gate>`` would fabricate a
+    # duplicate gate whenever the legitimate response page is empty.
+    persisted = agent_repo(request).list_agent_messages(task_id)
+    last_failure_index = -1
+    last_current_gate_index = -1
+    for index, message in enumerate(persisted):
+        if message.get("role") != "assistant":
+            continue
+        metadata = message.get("metadata") or {}
+        failure_envelope = metadata.get("failure_envelope") or {}
+        message_plan_id = str(
+            metadata.get("plan_id") or failure_envelope.get("plan_id") or ""
+        )
+        if (
+            metadata.get("error") or metadata.get("error_diagnostic")
+        ) and message_plan_id in {"", plan.id}:
+            last_failure_index = index
+        if (
+            not metadata.get("error")
+            and metadata.get("kind") == "gate"
+            and str(metadata.get("plan_id") or "") == plan.id
+            and str(metadata.get("step_id") or "") == gate.id
+        ):
+            last_current_gate_index = index
+    if last_current_gate_index > last_failure_index:
+        # A user turn after the gate consumes its interaction slot in the UI.
+        # If the plan nevertheless remains on the same awaiting-confirm step
+        # (for example an older client sent descriptive prose that was not
+        # recognized as a canonical confirmation), the persisted gate is now
+        # historical/read-only. Re-emit it transiently at the end so the user
+        # always has a recovery action instead of a dead-end conversation.
+        consumed_without_progress = any(
+            index > last_current_gate_index and message.get("role") == "user"
+            for index, message in enumerate(persisted)
+        )
+        if not consumed_without_progress:
+            return
+
+    composer = _plan_message_composer(request)
+    recovered = composer.gate_message(plan, gate, run_seq=0)
+    messages.append(
+        {
+            "id": f"recovered-gate:{plan.id}:{gate.id}:{plan.updated_at}",
+            "task_id": task_id,
+            "role": "assistant",
+            "stage": "chat",
+            "content": recovered.content,
+            "created_at": plan.updated_at,
+            "metadata": {
+                **recovered.metadata,
+                "recovered_from_plan": True,
+            },
+        }
+    )
+
+
+def _enrich_historical_workflow_errors(messages: list[dict]) -> None:
+    """Upgrade old generic failure cards without rewriting their audit records."""
+
+    for message in messages:
+        metadata = message.get("metadata") or {}
+        diagnostic = metadata.get("error_diagnostic")
+        if not isinstance(diagnostic, dict):
+            continue
+        enriched = enrich_workflow_error_diagnostic(diagnostic)
+        if enriched == diagnostic:
+            continue
+        generated_envelope = failure_envelope_for_diagnostic(enriched)
+        existing_envelope = metadata.get("failure_envelope")
+        if isinstance(existing_envelope, dict):
+            generated_envelope.update(existing_envelope)
+            generated_envelope.update(
+                {
+                    "error_kind": enriched.get(
+                        "error_kind", generated_envelope["error_kind"]
+                    ),
+                    "message": enriched.get("summary", generated_envelope["message"]),
+                    "retryable": bool(enriched.get("retryable", True)),
+                    "suggested_actions": list(enriched.get("actions") or []),
+                }
+            )
+        message["metadata"] = {
+            **metadata,
+            "error_diagnostic": enriched,
+            "failure_envelope": generated_envelope,
+        }
+
+
+def _enrich_historical_result_download(
+    request: Request,
+    task_id: str,
+    messages: list[dict],
+) -> None:
+    """Attach a transient download contract to old successful driver messages.
+
+    Older tasks either persisted the result dataset only inside plan-step output
+    or predate workflow-specific download copy.  The audit message remains
+    untouched; the API response is enriched on read so a reload receives the
+    same typed download action as a newly completed task.
+    """
+    plans = request.app.state.plan_repo.list_plans_for_task(task_id)
+    plans_by_id = {str(item.id): item for item in plans}
+    composer = None
+    for completion in messages:
+        if (
+            completion.get("role") != "assistant"
+            or "The plan is all complete." not in str(completion.get("content") or "")
+        ):
+            continue
+        metadata = dict(completion.get("metadata") or {})
+        existing = metadata.pop("result_dataset", None)
+        completion["metadata"] = metadata
+        plan_id = str(metadata.get("plan_id") or "").strip()
+        plan = plans_by_id.get(plan_id)
+        if plan is None:
+            continue
+        if composer is None:
+            composer = _plan_message_composer(request)
+        recovered = composer.latest_result_dataset_metadata(plan)
+        if recovered is None:
+            continue
+        completion["metadata"] = {
+            **metadata,
+            "result_dataset": {
+                **recovered,
+                **(
+                    {"recovered_from_plan": True}
+                    if not isinstance(existing, dict)
+                    or not str(existing.get("dataset_id") or "").strip()
+                    else {}
+                ),
+            },
+        }
+
+
+@router.post("/tasks/{task_id}/agent/start", status_code=202)
+def start_agent_task(
+    task_id: str,
+    payload: AgentModelRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    repo = agent_repo(request)
+    task = get_task_or_404(repo, task_id)
+    require_agent_task(task, DRIVER_AGENT_TASK_TYPES)
+    require_wired_agent_task_type(task, WIRED_AGENT_TASK_TYPES)
+    if task.task_type in DRIVER_AGENT_TASK_TYPES:
+        # The first risk-analysis turn is a deterministic intake question and
+        # must be visible immediately after task creation, even before any
+        # material (or model call) exists. Later turns keep the normal Agent
+        # contract and resolve the configured LLM before a plan is driven.
+        is_initial_deterministic_setup = task.task_type in {
+            TASK_TYPE_VINTAGE,
+            TASK_TYPE_PORTFOLIO,
+        } and not repo.list_agent_messages(task.id, limit=1)
+        agent_client = (
+            None
+            if is_initial_deterministic_setup
+            else resolve_driver_agent_client(request, task, payload)
+        )
+        return dispatch_driver_turn(
+            request,
+            repo,
+            task,
+            user_text=None,
+            agent_client=agent_client,
+            acceptance_mode=payload.acceptance_mode,
+            recovery_model_id=payload.model_id,
+            recovery_effort=payload.effort,
+        )
+    model_profile = resolve_agent_model(request, payload.model_id, payload.effort)
+    return dispatch_agent_validation_job(
+        repo_=repo,
+        task=task,
+        settings=request.app.state.settings,
+        model_profile=model_profile,
+        acceptance_mode=payload.acceptance_mode,
+        background_tasks=background_tasks,
+    )
+
+
+@router.post("/tasks/{task_id}/agent/messages", status_code=202)
+def post_agent_message(
+    task_id: str,
+    payload: AgentMessageRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    repo = agent_repo(request)
+    task = get_task_or_404(repo, task_id)
+    if payload.strategy_input is not None and task.task_type != TASK_TYPE_STRATEGY:
+        raise unprocessable("strategy_input Only for usestrategy Type of task.")
+    if payload.strategy_request is not None and task.task_type != TASK_TYPE_STRATEGY:
+        raise unprocessable("strategy_request Only for usestrategy Type of task.")
+    if payload.portfolio_request is not None and task.task_type != TASK_TYPE_PORTFOLIO:
+        raise unprocessable("portfolio_request Only for useportfolio Type of task.")
+    if payload.labeling_request is not None and task.task_type != TASK_TYPE_DATA_JOIN:
+        raise unprocessable("labeling_request Only for usedata_join Type of task.")
+    require_agent_task(task, DRIVER_AGENT_TASK_TYPES)
+    require_wired_agent_task_type(task, WIRED_AGENT_TASK_TYPES)
+    content = payload.content.strip()
+    if not content:
+        raise unprocessable("message content is required")
+    if looks_like_metric_rewrite_request(content) and task.task_type in {
+        TASK_TYPE_VALIDATION,
+        TASK_TYPE_VALIDATION_BATCH,
+    }:
+        user_message = repo.add_agent_message(
+            task_id,
+            role="user",
+            stage="chat",
+            content=content,
+            metadata={"intent": "reject_metric_rewrite"},
+        )
+        capture_user_preference_memory(request, task_id, user_message)
+        repo.add_agent_message(
+            task_id,
+            role="assistant",
+            stage="chat",
+            content=METRIC_REWRITE_REFUSAL,
+            metadata={"intent": "reject_metric_rewrite"},
+        )
+        return {
+            "task_id": task_id,
+            "status": "message_saved",
+            "messages": repo.list_agent_messages(task_id),
+        }
+    if looks_like_accept_suggested_contracts(content) and task.task_type == TASK_TYPE_VALIDATION_BATCH:
+        user_message = repo.add_agent_message(
+            task_id,
+            role="user",
+            stage="chat",
+            content=content,
+            metadata={"intent": "accept_suggested_contracts"},
+        )
+        capture_user_preference_memory(request, task_id, user_message)
+        outcome = confirm_unambiguous_batch_contracts(
+            db_path=request.app.state.settings.db_path,
+            parent_task_id=task_id,
+        )
+        parts = []
+        if outcome["confirmed"]:
+            parts.append("Confirmed by identification:" + ",".join(outcome["confirmed"]) + ".")
+        if outcome["skipped"]:
+            parts.append(
+                "These models are ambiguous and please indicate the model name and fields to be changed:"
+                + ",".join(outcome["skipped"])
+                + "."
+            )
+        if outcome["failed"]:
+            parts.append("Confirm failure:" + ";".join(outcome["failed"]) + ".")
+        if not parts:
+            parts.append("There are currently no pending import contracts.")
+        elif outcome["skipped"] or outcome["failed"]:
+            parts.append("No conflict-free models need not be selected on a case-by-case basis; the forms can still be checked.")
+        else:
+            parts.append("The contract is confirmed.")
+        repo.add_agent_message(
+            task_id,
+            role="assistant",
+            stage="input_confirmation",
+            content="\n".join(parts),
+            metadata={
+                "intent": "accept_suggested_contracts",
+                "confirmed": outcome["confirmed"],
+                "skipped": outcome["skipped"],
+                "failed": outcome["failed"],
+            },
+        )
+        return {
+            "task_id": task_id,
+            "status": "message_saved",
+            "messages": repo.list_agent_messages(task_id),
+        }
+    _validate_confirmation_snapshot(payload)
+    _validate_ui_action_contract(payload)
+    if payload.strategy_request is not None:
+        mixed_fields = [
+            name
+            for name, value in (
+                ("strategy_input", payload.strategy_input),
+                ("selection", payload.selection),
+                ("dedup_strategies", payload.dedup_strategies),
+                ("adjust_params", payload.adjust_params),
+                ("expected_step_id", payload.expected_step_id),
+                ("expected_plan_id", payload.expected_plan_id),
+                ("expected_plan_status", payload.expected_plan_status),
+                ("expected_plan_revision", payload.expected_plan_revision),
+                ("expected_plan_fingerprint", payload.expected_plan_fingerprint),
+                ("expected_step_fingerprint", payload.expected_step_fingerprint),
+                ("ui_action", payload.ui_action),
+                ("portfolio_request", payload.portfolio_request),
+                ("labeling_request", payload.labeling_request),
+            )
+            if value is not None
+        ]
+        if mixed_fields:
+            raise unprocessable(
+                "strategy_request The following structured input cannot be submitted:"
+                + ",".join(mixed_fields)
+                + "."
+            )
+        if is_stop_validation_intent(content):
+            raise unprocessable("Stop Commands Not withstrategy_request Submitted simultaneously.")
+    if payload.portfolio_request is not None:
+        mixed_fields = [
+            name
+            for name, value in (
+                ("strategy_input", payload.strategy_input),
+                ("strategy_request", payload.strategy_request),
+                ("selection", payload.selection),
+                ("dedup_strategies", payload.dedup_strategies),
+                ("adjust_params", payload.adjust_params),
+                ("expected_step_id", payload.expected_step_id),
+                ("expected_plan_id", payload.expected_plan_id),
+                ("expected_plan_status", payload.expected_plan_status),
+                ("expected_plan_revision", payload.expected_plan_revision),
+                ("expected_plan_fingerprint", payload.expected_plan_fingerprint),
+                ("expected_step_fingerprint", payload.expected_step_fingerprint),
+                ("ui_action", payload.ui_action),
+                ("labeling_request", payload.labeling_request),
+            )
+            if value is not None
+        ]
+        if mixed_fields:
+            raise unprocessable(
+                "portfolio_request The following structured input cannot be submitted:"
+                + ",".join(mixed_fields)
+                + "."
+            )
+        if is_stop_validation_intent(content):
+            raise unprocessable("Stop Commands Not withportfolio_request Submitted simultaneously.")
+    if payload.labeling_request is not None:
+        mixed_fields = [
+            name
+            for name, value in (
+                ("strategy_input", payload.strategy_input),
+                ("strategy_request", payload.strategy_request),
+                ("portfolio_request", payload.portfolio_request),
+                ("selection", payload.selection),
+                ("dedup_strategies", payload.dedup_strategies),
+                ("adjust_params", payload.adjust_params),
+                ("expected_step_id", payload.expected_step_id),
+                ("expected_plan_id", payload.expected_plan_id),
+                ("expected_plan_status", payload.expected_plan_status),
+                ("expected_plan_revision", payload.expected_plan_revision),
+                ("expected_plan_fingerprint", payload.expected_plan_fingerprint),
+                ("expected_step_fingerprint", payload.expected_step_fingerprint),
+                ("ui_action", payload.ui_action),
+            )
+            if value is not None
+        ]
+        if mixed_fields:
+            raise unprocessable(
+                "labeling_request The following structured input cannot be submitted:"
+                + ",".join(mixed_fields)
+                + "."
+            )
+        if is_stop_validation_intent(content):
+            raise unprocessable("Stop Commands Not withlabeling_request Submitted simultaneously.")
+    allowed_ui_actions = {
+        "confirm_roles",
+        "confirm_dedup",
+        "apply_join_keys",
+        "exclude_join_feature",
+        "confirm_features",
+        "adjust_screen_thresholds",
+        "confirm_feature_binning",
+        "apply_modeling_setup",
+        "confirm_adoption",
+        "confirm_gate",
+        "start_plan",
+    }
+    if payload.ui_action is not None and payload.ui_action not in allowed_ui_actions:
+        raise unprocessable("invalid ui_action")
+    if payload.ui_action is not None and (
+        is_stop_validation_intent(content)
+        or confirmation_is_explicitly_withheld(content)
+    ):
+        raise conflict("Interface operation conflicts with stop commands. Please re-select after refreshing the page.")
+    if payload.strategy_input is not None:
+        mixed_fields = [
+            name
+            for name, value in (
+                ("strategy_request", payload.strategy_request),
+                ("portfolio_request", payload.portfolio_request),
+                ("labeling_request", payload.labeling_request),
+                ("selection", payload.selection),
+                ("dedup_strategies", payload.dedup_strategies),
+                ("adjust_params", payload.adjust_params),
+                ("expected_step_id", payload.expected_step_id),
+                ("expected_plan_id", payload.expected_plan_id),
+                ("expected_plan_status", payload.expected_plan_status),
+                ("expected_plan_revision", payload.expected_plan_revision),
+                ("expected_plan_fingerprint", payload.expected_plan_fingerprint),
+                ("expected_step_fingerprint", payload.expected_step_fingerprint),
+                ("ui_action", payload.ui_action),
+            )
+            if value is not None
+        ]
+        if mixed_fields:
+            raise unprocessable(
+                "strategy_input The following structured input cannot be submitted:"
+                + ",".join(mixed_fields)
+                + "."
+            )
+    strategy_input = _domain_strategy_input(payload.strategy_input)
+    if strategy_input is not None and is_stop_validation_intent(content):
+        raise unprocessable("Stop Commands Not withstrategy_input Submitted simultaneously.")
+    if (
+        strategy_input is not None
+        and strategy_input.entry_mode == "strategy_development"
+    ):
+        clarification = strategy_development_clarification(strategy_input)
+        if clarification is not None:
+            raise unprocessable(clarification)
+    if payload.ui_action is None and is_stop_validation_intent(content):
+        user_message = repo.add_agent_message(
+            task_id,
+            role="user",
+            stage="chat",
+            content=content,
+            metadata={"intent": "stop"},
+        )
+        capture_user_preference_memory(request, task_id, user_message)
+        return handle_agent_stop_message(repo, task)
+    if task.task_type in DRIVER_AGENT_TASK_TYPES:
+        # A typed UI or Candidate Lab request is already executable user input.
+        # It must remain usable in agent mode without resolving or calling an LLM.
+        agent_client = (
+            None
+            if (
+                payload.ui_action is not None
+                or payload.strategy_request is not None
+                or payload.portfolio_request is not None
+                or payload.labeling_request is not None
+                or is_labeling_deterministic_turn(
+                    repo,
+                    request.app.state.plan_repo,
+                    task,
+                    content,
+                )
+                or is_portfolio_deterministic_turn(
+                    repo,
+                    request.app.state.plan_repo,
+                    task,
+                    content,
+                )
+            )
+            else resolve_driver_agent_client(request, task, payload)
+        )
+        return dispatch_driver_turn(
+            request,
+            repo,
+            task,
+            user_text=content,
+            agent_client=agent_client,
+            acceptance_mode=payload.acceptance_mode,
+            selection=payload.selection,
+            dedup_strategies=payload.dedup_strategies,
+            adjust_params=payload.adjust_params,
+            expected_step_id=payload.expected_step_id,
+            expected_plan_id=payload.expected_plan_id,
+            expected_plan_status=payload.expected_plan_status,
+            expected_plan_revision=payload.expected_plan_revision,
+            expected_plan_fingerprint=payload.expected_plan_fingerprint,
+            expected_step_fingerprint=payload.expected_step_fingerprint,
+            ui_action=payload.ui_action,
+            strategy_input=strategy_input,
+            strategy_request=(
+                None
+                if payload.strategy_request is None
+                else payload.strategy_request.model_dump(
+                    mode="python",
+                    exclude_none=True,
+                )
+            ),
+            portfolio_request=(
+                None
+                if payload.portfolio_request is None
+                else payload.portfolio_request.model_dump(
+                    mode="python",
+                    exclude_none=True,
+                )
+            ),
+            labeling_request=(
+                None
+                if payload.labeling_request is None
+                else payload.labeling_request.model_dump(
+                    mode="python",
+                    exclude_none=True,
+                )
+            ),
+            recovery_model_id=payload.model_id,
+            recovery_effort=payload.effort,
+        )
+    if is_agent_material_reselection_intent(content):
+        reject_if_task_has_active_job(repo, task_id)
+        ui_action = {"type": "select_validation_materials"}
+        user_message = repo.add_agent_message(
+            task_id,
+            role="user",
+            stage="chat",
+            content=content,
+            metadata={"intent": "select_materials"},
+        )
+        capture_user_preference_memory(request, task_id, user_message)
+        repo.add_agent_message(
+            task_id,
+            role="assistant",
+            stage="chat",
+            content=(
+                "Re-lock the subsequent popup \"Reselect the authentication material\" windowNotebook,Sample data,"
+                "PMML and data dictionary; and then re-scan material after saving."
+            ),
+            metadata={"intent": "select_materials", "ui_action": ui_action},
+        )
+        return {
+            "task_id": task_id,
+            "status": "awaiting_material_selection",
+            "ui_action": ui_action,
+            "messages": repo.list_agent_messages(task_id),
+        }
+    conversation = repo.list_agent_messages(task_id)
+    pending_report_draft = latest_pending_agent_report_draft(conversation)
+    if is_agent_report_confirm_intent(content) and pending_report_draft:
+        user_message = repo.add_agent_message(
+            task_id,
+            role="user",
+            stage="chat",
+            content=content,
+            metadata={"intent": "confirm_report"},
+        )
+        capture_user_preference_memory(request, task_id, user_message)
+        return confirm_agent_report_conclusions(
+            repo_=repo,
+            task=task,
+            task_id=task_id,
+            settings=request.app.state.settings,
+            text_values=pending_report_draft["values"],
+            expected_revision=pending_report_draft["report_revision"],
+            draft_message_id=pending_report_draft["message_id"],
+            draft_edit_revision=pending_report_draft["draft_edit_revision"],
+            background_tasks=background_tasks,
+            hook_dispatcher=getattr(request.app.state, "hook_dispatcher", None),
+        )
+    model_profile = resolve_agent_model(request, payload.model_id, payload.effort)
+    rerun_stage = agent_rerun_stage(content)
+    if rerun_stage:
+        reject_if_task_has_active_job(repo, task_id)
+        require_agent_rerun_stage_reached(task, rerun_stage)
+        continue_after_rerun = rerun_stage in {
+            "scan",
+            "reproducibility",
+            "metrics",
+        } and is_continue_validation_intent(content)
+        rerun_intent = (
+            "regenerate_report_draft"
+            if rerun_stage == "word_conclusion_draft"
+            and is_agent_report_regenerate_intent(content)
+            else "rerun_stage"
+        )
+        stage_instruction = content
+        directive_count = 0
+        if rerun_stage == "word_conclusion_draft":
+            stage_instruction, directive_count = _report_revision_instruction_context(
+                conversation,
+                content,
+            )
+        user_message = repo.add_agent_message(
+            task_id,
+            role="user",
+            stage="chat",
+            content=content,
+            metadata={
+                **model_metadata(model_profile),
+                "intent": rerun_intent,
+                "target_stage": rerun_stage,
+                "continue_after_rerun": continue_after_rerun,
+                **(
+                    {"active_report_directive_count": directive_count}
+                    if directive_count
+                    else {}
+                ),
+            },
+        )
+        capture_user_preference_memory(request, task_id, user_message)
+        task = reset_agent_task_for_rerun(repo, task_id, rerun_stage)
+        return dispatch_agent_validation_job(
+            repo_=repo,
+            task=task,
+            settings=request.app.state.settings,
+            model_profile=model_profile,
+            acceptance_mode=(
+                "auto_accept" if continue_after_rerun else payload.acceptance_mode
+            ),
+            background_tasks=background_tasks,
+            forced_stage=rerun_stage,
+            stage_instruction=stage_instruction,
+        )
+    if is_agent_report_regenerate_intent(content) and pending_report_draft:
+        reject_if_task_has_active_job(repo, task_id)
+        user_message = repo.add_agent_message(
+            task_id,
+            role="user",
+            stage="chat",
+            content=content,
+            metadata={
+                **model_metadata(model_profile),
+                "intent": "regenerate_report_draft",
+            },
+        )
+        capture_user_preference_memory(request, task_id, user_message)
+        return dispatch_agent_validation_job(
+            repo_=repo,
+            task=task,
+            settings=request.app.state.settings,
+            model_profile=model_profile,
+            acceptance_mode=payload.acceptance_mode,
+            background_tasks=background_tasks,
+        )
+    if pending_report_draft:
+        semantic_report_authorization = review_validation_semantic_authorization(
+            request,
+            repo,
+            task,
+            instruction=content,
+            model_id=payload.model_id,
+            effort=payload.effort,
+            target_stage="report_confirmation",
+        )
+        if semantic_report_authorization is not None:
+            user_message = repo.add_agent_message(
+                task_id,
+                role="user",
+                stage="chat",
+                content=content,
+                metadata={
+                    **model_metadata(model_profile),
+                    "intent": "confirm_report",
+                    "semantic_authorization": semantic_report_authorization,
+                },
+            )
+            capture_user_preference_memory(request, task_id, user_message)
+            return confirm_agent_report_conclusions(
+                repo_=repo,
+                task=task,
+                task_id=task_id,
+                settings=request.app.state.settings,
+                text_values=pending_report_draft["values"],
+                expected_revision=pending_report_draft["report_revision"],
+                draft_message_id=pending_report_draft["message_id"],
+                draft_edit_revision=pending_report_draft["draft_edit_revision"],
+                background_tasks=background_tasks,
+                hook_dispatcher=getattr(request.app.state, "hook_dispatcher", None),
+            )
+    advance_intent = is_agent_advance_intent(content)
+    semantic_authorization = None
+    if not advance_intent and not pending_report_draft and not is_confirm(content):
+        semantic_authorization = review_validation_semantic_authorization(
+            request,
+            repo,
+            task,
+            instruction=content,
+            model_id=payload.model_id,
+            effort=payload.effort,
+        )
+    if not advance_intent and semantic_authorization is None:
+        user_message = repo.add_agent_message(
+            task_id,
+            role="user",
+            stage="chat",
+            content=content,
+            metadata=model_metadata(model_profile),
+        )
+        capture_user_preference_memory(request, task_id, user_message)
+        conversation = repo.list_agent_messages(task_id)
+        evidence = agent_chat_evidence(request, repo, task, conversation)
+        memory_context = agent_memory_context(
+            request,
+            task,
+            stage="chat",
+            user_message=content,
+            evidence=evidence,
+        )
+        message = add_and_stream_agent_message(
+            repo,
+            task_id,
+            stage="chat",
+            model_profile=model_profile,
+            producer=lambda on_delta: answer_chat_message(
+                task=task,
+                user_message=content,
+                conversation=conversation,
+                evidence=evidence,
+                memory_context=memory_context,
+                model_profile=model_profile,
+                on_delta=on_delta,
+            ),
+        )
+        audit_agent_memory_use(request, message, task_id=task_id)
+        return {
+            "task_id": task_id,
+            "status": "message_saved",
+            "messages": repo.list_agent_messages(task_id),
+        }
+    user_message = repo.add_agent_message(
+        task_id,
+        role="user",
+        stage="chat",
+        content=content,
+        metadata={
+            **model_metadata(model_profile),
+            "intent": "advance",
+            **(
+                {"semantic_authorization": semantic_authorization}
+                if semantic_authorization is not None
+                else {}
+            ),
+        },
+    )
+    capture_user_preference_memory(request, task_id, user_message)
+    return dispatch_agent_validation_job(
+        repo_=repo,
+        task=task,
+        settings=request.app.state.settings,
+        model_profile=model_profile,
+        acceptance_mode=payload.acceptance_mode,
+        background_tasks=background_tasks,
+    )
+
+
+@router.post("/tasks/{task_id}/agent/stop", status_code=202)
+def stop_agent_action(task_id: str, request: Request) -> dict:
+    repo = agent_repo(request)
+    task = get_task_or_404(repo, task_id)
+    require_agent_task(task, DRIVER_AGENT_TASK_TYPES)
+    return handle_agent_stop_message(repo, task)
+
+
+@router.post("/tasks/{task_id}/agent/summarize")
+def summarize_agent_task(
+    task_id: str,
+    payload: AgentModelRequest,
+    request: Request,
+) -> dict:
+    repo = agent_repo(request)
+    task = get_task_or_404(repo, task_id)
+    require_agent_task(task, DRIVER_AGENT_TASK_TYPES)
+    model_profile = resolve_agent_model(request, payload.model_id, payload.effort)
+    evidence = agent_evidence(request, task_id)
+    memory_context = agent_memory_context(
+        request,
+        task,
+        stage="metrics",
+        evidence=evidence,
+    )
+    content, metadata = summarize_stage(
+        task=task,
+        stage="metrics",
+        evidence=evidence,
+        memory_context=memory_context,
+        model_profile=model_profile,
+        fallback="Current validation evidence is read. Please review the model performance in detail, combining fraction consistency, effectiveness stability and pressure tests.",
+    )
+    metadata.update(model_metadata(model_profile))
+    message = repo.add_agent_message(
+        task_id,
+        role="assistant",
+        stage="summary",
+        content=content,
+        metadata=metadata,
+    )
+    audit_agent_memory_use(request, message, task_id=task_id)
+    return {"message": message, "messages": repo.list_agent_messages(task_id)}
+
+
+@router.post("/tasks/{task_id}/agent/report-draft")
+def draft_agent_report_conclusions(
+    task_id: str,
+    payload: AgentModelRequest,
+    request: Request,
+) -> dict:
+    repo = agent_repo(request)
+    task = get_task_or_404(repo, task_id)
+    require_agent_task(task, DRIVER_AGENT_TASK_TYPES)
+    model_profile = resolve_agent_model(request, payload.model_id, payload.effort)
+    evidence = agent_evidence(request, task_id)
+    saved_draft = latest_report_draft_context(repo.list_agent_messages(task_id))
+    if saved_draft:
+        evidence["report_draft"] = saved_draft
+    memory_context = agent_memory_context(
+        request,
+        task,
+        stage="word_conclusion_draft",
+        evidence=evidence,
+    )
+    values, metadata = generate_word_conclusions(
+        task=task,
+        evidence=evidence,
+        memory_context=memory_context,
+        model_profile=model_profile,
+    )
+    metadata.update(model_metadata(model_profile))
+    _, report_revision = repo.get_report_values(task_id)
+    message = repo.add_agent_message(
+        task_id,
+        role="assistant",
+        stage="word_conclusion_draft",
+        content=format_conclusion_values(values),
+        metadata={
+            **metadata,
+            "draft_values": values,
+            "report_revision": report_revision,
+        },
+    )
+    audit_agent_memory_use(request, message, task_id=task_id)
+    return {
+        "message": message,
+        "text_values": values,
+        "messages": repo.list_agent_messages(task_id),
+    }
+
+
+@router.put("/tasks/{task_id}/agent/report-draft")
+def save_agent_report_draft_route(
+    task_id: str, payload: AgentReportDraftSaveRequest, request: Request,
+) -> dict:
+    repo = agent_repo(request)
+    task = get_task_or_404(repo, task_id)
+    require_agent_task(task, DRIVER_AGENT_TASK_TYPES)
+    try:
+        message = repo.save_agent_report_draft(
+            task_id, message_id=payload.draft_message_id,
+            edit_revision=payload.draft_edit_revision,
+            expected_revision=payload.revision, values=payload.text_values,
+        )
+    except ConflictError as exc:
+        raise conflict(str(exc)) from exc
+    except ValueError as exc:
+        raise unprocessable(str(exc)) from exc
+    return {"message": message}
+
+
+@router.post("/tasks/{task_id}/agent/report-draft/confirm", status_code=202)
+def confirm_agent_report_conclusions_route(
+    task_id: str,
+    payload: AgentReportDraftConfirmRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    repo = agent_repo(request)
+    task = get_task_or_404(repo, task_id)
+    require_agent_task(task, DRIVER_AGENT_TASK_TYPES)
+    return confirm_agent_report_conclusions(
+        repo_=repo,
+        task=task,
+        task_id=task_id,
+        settings=request.app.state.settings,
+        text_values=payload.text_values,
+        expected_revision=payload.revision,
+        draft_message_id=payload.draft_message_id,
+        draft_edit_revision=payload.draft_edit_revision,
+        background_tasks=background_tasks,
+        hook_dispatcher=getattr(request.app.state, "hook_dispatcher", None),
+    )

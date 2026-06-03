@@ -1,0 +1,318 @@
+from datetime import datetime
+from pathlib import Path
+import re
+import sqlite3
+
+from marvis.api_task_helpers import format_validation_batch_parent_name
+from marvis.repositories.tasks import TaskRepository
+from marvis.domain import (
+    TASK_STATUS_REASON_SERVER_RESTART,
+    TASK_STATUS_REASON_USER_CANCELLED,
+    TASK_TYPE_DATA_JOIN,
+    TASK_TYPE_FEATURE_ANALYSIS,
+    TASK_TYPE_MODELING,
+    TASK_TYPE_PORTFOLIO,
+    TASK_TYPE_STRATEGY,
+    TASK_TYPE_VALIDATION,
+    TASK_TYPE_VALIDATION_BATCH,
+    TASK_TYPE_VINTAGE,
+    TaskRecord,
+    TaskStatus,
+)
+from marvis.repositories.plans import PlanRepository
+from marvis.repositories.validation_batches import ValidationBatchRepository
+from marvis.safe_paths import safe_filename_component
+
+_UNSET = object()
+_TASK_REPORT_LABELS = {
+    TASK_TYPE_VALIDATION: "Model validation report",
+    TASK_TYPE_FEATURE_ANALYSIS: "Characteristic analysis",
+    TASK_TYPE_DATA_JOIN: "Data-processing reports",
+    TASK_TYPE_MODELING: "Model development report",
+    TASK_TYPE_STRATEGY: "Strategic analysis report",
+    TASK_TYPE_VINTAGE: "Risk analysis",
+    TASK_TYPE_PORTFOLIO: "Portfolio analysis reports",
+}
+
+
+def _latest_workflow_statuses(
+    repo: TaskRepository,
+    task_ids: list[str],
+) -> dict[str, str]:
+    """Read the optional V2 plan projection without breaking V1-only stores.
+
+    Validation-only embeddings and a few supported migration/test fixtures own a
+    task database that predates the orchestration tables.  ``workflow_status`` is
+    additive metadata for those callers, so an absent ``plans`` table means
+    "there is no plan state", not that the otherwise valid task API is unusable.
+    Other SQLite failures still propagate.
+    """
+
+    try:
+        return PlanRepository(repo.db_path).latest_workflow_statuses_for_tasks(
+            task_ids
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table: plans" not in str(exc).lower():
+            raise
+        return {}
+
+
+def task_payload(
+    repo: TaskRepository,
+    task: TaskRecord,
+    tasks_dir: Path | None = None,
+    *,
+    active_job_kind: str | None | object = _UNSET,
+    workflow_status: str | None | object = _UNSET,
+    batch_item_count: int | None | object = _UNSET,
+) -> dict:
+    """``active_job_kind`` defaults to a sentinel so callers can distinguish "not
+    supplied, look it up" from "supplied, and it really is None" (PERF-6: batch
+    callers like list_task_payloads precompute active job kinds for every task in
+    one query and pass the result through here instead of letting each payload
+    open its own connection via repo.get_active_job_kind)."""
+    resolved_active_job_kind = (
+        repo.get_active_job_kind(task.id)
+        if active_job_kind is _UNSET
+        else active_job_kind
+    )
+    resolved_workflow_status = (
+        _latest_workflow_statuses(repo, [task.id]).get(task.id)
+        if workflow_status is _UNSET
+        else workflow_status
+    )
+    payload = {
+        **task_to_dict(task),
+        "workflow_status": resolved_workflow_status,
+        "active_job_kind": resolved_active_job_kind,
+        "failure_stage": task_failure_stage(repo, task),
+        "failure_reason_code": task_failure_reason_code(task),
+        "stop_reason_code": task_stop_reason_code(repo, task),
+        "stopped": task_stopped(repo, task),
+        "report_available": task_report_available(tasks_dir, task.id),
+    }
+    return _apply_validation_batch_display_fields(
+        payload,
+        task,
+        batch_item_count=batch_item_count,
+        repo=repo,
+    )
+
+
+def list_task_payloads(
+    repo: TaskRepository,
+    tasks: list[TaskRecord],
+    tasks_dir: Path | None = None,
+) -> list[dict]:
+    """Batched task_payload for the polling task-list endpoint (PERF-6): resolves
+    active_job_kind for all tasks with a single query instead of one connection
+    per task, then reuses task_payload's per-task field derivation unchanged.
+    The latest plan workflow state is batched the same way so polling does not
+    introduce one plan query per task."""
+    task_ids = [task.id for task in tasks]
+    active_job_kinds = repo.get_active_job_kinds_for_tasks(task_ids)
+    workflow_statuses = _latest_workflow_statuses(repo, task_ids)
+    batch_ids = [
+        task.id for task in tasks if task.task_type == TASK_TYPE_VALIDATION_BATCH
+    ]
+    batch_item_counts = (
+        ValidationBatchRepository(repo.db_path).item_counts_for_parents(batch_ids)
+        if batch_ids
+        else {}
+    )
+    return [
+        task_payload(
+            repo,
+            task,
+            tasks_dir,
+            active_job_kind=active_job_kinds.get(task.id),
+            workflow_status=workflow_statuses.get(task.id),
+            batch_item_count=(
+                batch_item_counts.get(task.id)
+                if task.task_type == TASK_TYPE_VALIDATION_BATCH
+                else None
+            ),
+        )
+        for task in tasks
+    ]
+
+
+def task_to_dict(task: TaskRecord) -> dict:
+    from dataclasses import asdict
+
+    return asdict(task)
+
+
+def _parse_iso_datetime(value: str) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _apply_validation_batch_display_fields(
+    payload: dict,
+    task: TaskRecord,
+    *,
+    batch_item_count: int | None | object,
+    repo: TaskRepository,
+) -> dict:
+    if task.task_type != TASK_TYPE_VALIDATION_BATCH:
+        return payload
+    if batch_item_count is _UNSET:
+        counts = ValidationBatchRepository(repo.db_path).item_counts_for_parents(
+            [task.id]
+        )
+        item_count = counts.get(task.id)
+    else:
+        item_count = batch_item_count
+    if item_count is None:
+        return payload
+    count = int(item_count)
+    payload["item_count"] = count
+    payload["model_name"] = format_validation_batch_parent_name(
+        count,
+        _parse_iso_datetime(task.created_at),
+    )
+    return payload
+
+
+def task_report_available(tasks_dir: Path | None, task_id: str) -> bool:
+    if tasks_dir is None:
+        return False
+    return (tasks_dir / task_id / "outputs" / "validation_report.docx").exists()
+
+
+def task_report_download_filename(task: TaskRecord, suffix: str) -> str:
+    model_name = safe_filename_component(task.model_name, fallback="Model")
+    report_label = _TASK_REPORT_LABELS.get(task.task_type, "Model validation report")
+    return (
+        f"{model_name}_{report_label}_"
+        f"{task_created_date_for_filename(task)}{suffix}"
+    )
+
+
+def task_created_date_for_filename(task: TaskRecord) -> str:
+    raw_created_at = str(task.created_at or "").strip()
+    try:
+        parsed = datetime.fromisoformat(raw_created_at.replace("Z", "+00:00"))
+    except ValueError:
+        digits = re.sub(r"\D+", "", raw_created_at)[:8]
+        return digits or "unknown_date"
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone()
+    return parsed.strftime("%Y%m%d")
+
+
+def task_failure_stage(repo: TaskRepository, task: TaskRecord) -> str | None:
+    if task.status != TaskStatus.FAILED:
+        return None
+    if task_failed_during_scan(task):
+        return "scan"
+    message_stage = legacy_failure_stage_from_message(task.status_message)
+    job_stage = failure_stage_from_job_kind(repo.get_latest_failed_job_kind(task.id))
+    return earliest_failure_stage(message_stage, job_stage)
+
+
+def task_failed_during_scan(task: TaskRecord) -> bool:
+    return str(task.status_message or "").startswith("Material scanning failed:")
+
+
+def task_failure_reason_code(task: TaskRecord) -> str | None:
+    if task.status != TaskStatus.FAILED:
+        return None
+    reason = normalized_status_reason(task.status_reason_code)
+    if reason == TASK_STATUS_REASON_SERVER_RESTART:
+        return reason
+    return legacy_failure_reason_code_from_message(task.status_message)
+
+
+def task_stop_reason_code(repo: TaskRepository, task: TaskRecord) -> str | None:
+    reason = normalized_status_reason(task.status_reason_code)
+    if reason == TASK_STATUS_REASON_USER_CANCELLED:
+        return reason
+    # Successful terminals are never "stopped": only the structured
+    # status_reason_code may mark a completed task as user-cancelled — not the fuzzy
+    # legacy message text, which could contain "Canceled"/"cancelled" incidentally.
+    if task.status in {TaskStatus.SUCCEEDED, TaskStatus.REVIEW_REQUIRED}:
+        return None
+    return legacy_stop_reason_code_from_message(task.status_message)
+
+
+def task_stopped(repo: TaskRepository, task: TaskRecord) -> bool:
+    return task_stop_reason_code(repo, task) == TASK_STATUS_REASON_USER_CANCELLED
+
+
+def normalized_status_reason(reason: str | None) -> str:
+    value = str(reason or "")
+    if value in {
+        TASK_STATUS_REASON_USER_CANCELLED,
+        TASK_STATUS_REASON_SERVER_RESTART,
+    }:
+        return value
+    return ""
+
+
+def failure_stage_from_job_kind(kind: str | None) -> str | None:
+    return {
+        "notebook": "notebook",
+        "metrics": "metrics",
+        "report": "report",
+    }.get(str(kind or ""))
+
+
+def earliest_failure_stage(*stages: str | None) -> str | None:
+    stage_order = {
+        "scan": 0,
+        "notebook": 1,
+        "metrics": 2,
+        "report": 3,
+    }
+    ranked = [
+        stage
+        for stage in stages
+        if stage in stage_order
+    ]
+    if not ranked:
+        return None
+    return min(ranked, key=lambda stage: stage_order[stage])
+
+
+def legacy_failure_stage_from_message(message: str) -> str | None:
+    text = str(message or "")
+    if re.search(
+        r"Model Recoverability Validation Failed|notebook failed at cell|reproducibility",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return "notebook"
+    if re.search(
+        r"Model Effects&Stability verification failed|Indicators|metrics|notebook metrics failed|"
+        r"sample column check failed|data dictionary missing columns|"
+        r"live notebook kernel is not available",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return "metrics"
+    if re.search(r"Report output failed|Report|Word|report", text, flags=re.IGNORECASE):
+        return "report"
+    if re.search(r"notebook", text, flags=re.IGNORECASE):
+        return "notebook"
+    return None
+
+
+def legacy_failure_reason_code_from_message(message: str) -> str | None:
+    if str(message or "") == "reclaimed: server restart while running":
+        return TASK_STATUS_REASON_SERVER_RESTART
+    return None
+
+
+def legacy_stop_reason_code_from_message(message: str) -> str | None:
+    text = str(message or "")
+    if "cancelled" in text.lower() or "Stopped" in text or "Canceled" in text:
+        return TASK_STATUS_REASON_USER_CANCELLED
+    return None
