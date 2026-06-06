@@ -1,0 +1,426 @@
+.welcome-task-card:focus-visible {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.workspace-welcome {
+  grid-column: 1 / -1;
+  grid-row: 1 / -1;
+  display: none;
+  min-height: 100%;
+  padding: 28px;
+  text-align: center;
+}
+
+.workspace-welcome-inner {
+  display: grid;
+  width: min(1040px, 100%);
+  justify-items: center;
+  transform: translateY(-2vh);
+}
+
+.workspace-brand-logo {
+  width: 76px;
+  height: 76px;
+  margin: 0 0 16px;
+  object-fit: contain;
+}
+
+.workspace-welcome h2 {
+  max-width: none;
+  margin: 0;
+  color: var(--text);
+  font-size: 28px;
+  line-height: 1.18;
+  letter-spacing: 0;
+  white-space: nowrap;
+  word-break: keep-all;
+}
+
+.workspace-greeting-nowrap {
+  white-space: nowrap;
+}
+
+.welcome-task-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  width: 100%;
+  max-width: 1040px;
+  gap: 12px;
+  margin-top: clamp(24px, 4vh, 36px);
+}
+
+.welcome-task-card {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  padding: 18px 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  background: var(--surface);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 180ms ease,
+    box-shadow 220ms ease,
+    transform 220ms ease;
+}
+
+/* tone-keyed corner glow, echoing the status hero's glass state */
+.welcome-task-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0;
+  background: radial-gradient(
+    82% 130% at 100% -12%,
+    color-mix(in srgb, var(--tone, var(--accent)) 22%, transparent),
+    transparent 60%
+  );
+  transition: opacity 240ms ease;
+}
+
+.welcome-task-card > * {
+  position: relative;
+  z-index: 1;
+}
+
+.welcome-task-card[data-task-kind="feature_analysis"] { --tone: var(--tone-feature-analysis); }
+.welcome-task-card[data-task-kind="data_join"] { --tone: var(--tone-data-join); }
+.welcome-task-card[data-task-kind="modeling"] { --tone: var(--tone-modeling); }
+.welcome-task-card[data-task-kind="validation"] { --tone: var(--tone-validation); }
+.welcome-task-card[data-task-kind="strategy"] { --tone: var(--tone-strategy); }
+.welcome-task-card[data-task-kind="vintage"] { --tone: var(--tone-vintage); }
+.welcome-task-card[data-task-kind="portfolio"] { --tone: var(--tone-portfolio); }
+
+.welcome-task-card.available:hover {
+  border-color: color-mix(in srgb, var(--tone, var(--accent)) 26%, var(--border));
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--tone, var(--accent)) 12%, rgba(0, 0, 0, 0.05));
+  transform: none;
+}
+
+/* card-level tone glow in the corner on hover (this is the card glow the user
+   wants kept — only the under-icon glow was removed) */
+.welcome-task-card.available:hover::before {
+  opacity: 0.65;
+}
+
+.welcome-task-card:disabled {
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--surface-soft) 78%, var(--surface));
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+/* plain icon (no tile, no resting shadow); on hover it grows + floats. */
+.welcome-task-icon {
+  position: relative;
+  display: inline-flex;
+  width: 44px;
+  height: 44px;
+  align-items: center;
+  justify-content: center;
+  color: var(--tone, var(--accent));
+  transition: transform 240ms cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+
+@keyframes welcome-icon-sheen {
+  0% { opacity: 0; transform: translateX(0) skewX(-18deg); }
+  8% { opacity: 1; }
+  82% { opacity: 1; }
+  100% { opacity: 0; transform: translateX(72px) skewX(-18deg); }
+}
+
+/* Solid, layered "Solid" glyphs: filled by default, with stacked depth layers.
+   The hover drop-shadow lives HERE (on the glyph), not on the icon box, so it
+   only shadows the glyph silhouette — never the sheen overlay. Rest is a
+   transparent shadow so the hover transition is smooth (no flicker). */
+.welcome-task-icon svg {
+  position: relative;
+  z-index: 1;
+  flex: none;
+  width: 35px;
+  height: 35px;
+  fill: currentColor;
+  stroke: none;
+  filter: drop-shadow(0 0 0 transparent);
+  transition: filter 240ms ease;
+}
+
+.welcome-task-icon svg .icon-sheen {
+  display: none;
+}
+
+.welcome-task-sheen {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  -webkit-mask-image: var(--welcome-icon-mask-image);
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  -webkit-mask-size: var(--welcome-icon-mask-size, 35px 35px);
+  mask-image: var(--welcome-icon-mask-image);
+  mask-repeat: no-repeat;
+  mask-position: center;
+  mask-size: var(--welcome-icon-mask-size, 35px 35px);
+}
+
+.welcome-task-sheen::before {
+  content: "";
+  position: absolute;
+  top: -10px;
+  left: -18px;
+  width: 9px;
+  height: 60px;
+  border-radius: var(--radius-pill);
+  opacity: 0;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 0%,
+    rgba(255, 255, 255, 0.42) 28%,
+    rgba(255, 255, 255, 0.98) 50%,
+    rgba(255, 255, 255, 0.42) 72%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  transform: translateX(0) skewX(-18deg);
+  will-change: transform, opacity;
+}
+
+/* Optical-size normalization: each glyph fills the 24×24 viewBox differently.
+   Model development is the visual target; other icons scale their largest
+   colored silhouette dimension to match its ~28.8px rendered size. */
+.welcome-task-card[data-task-kind="feature_analysis"] .welcome-task-icon svg {
+  width: 41px;
+  height: 41px;
+}
+
+.welcome-task-card[data-task-kind="validation"] .welcome-task-icon svg {
+  width: 39px;
+  height: 39px;
+}
+
+.welcome-task-card[data-task-kind="data_join"] .welcome-task-icon svg {
+  width: 40px;
+  height: 40px;
+}
+
+.welcome-task-card[data-task-kind="modeling"] .welcome-task-icon svg {
+  width: 36px;
+  height: 36px;
+}
+
+.welcome-task-card[data-task-kind="vintage"] .welcome-task-icon svg {
+  width: 41px;
+  height: 41px;
+}
+
+.welcome-task-card[data-task-kind="strategy"] .welcome-task-icon svg {
+  width: 43px;
+  height: 43px;
+}
+
+.welcome-task-card[data-task-kind="portfolio"] .welcome-task-icon svg {
+  width: 41px;
+  height: 41px;
+}
+
+.welcome-task-card[data-task-kind="feature_analysis"] .welcome-task-icon {
+  --welcome-icon-mask-size: 41px 41px;
+  --welcome-icon-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%3E%3Crect%20x%3D%274.4%27%20y%3D%2716.6%27%20width%3D%2717%27%20height%3D%273.4%27%20rx%3D%271.6%27%20fill%3D%27black%27%2F%3E%3Crect%20x%3D%275%27%20y%3D%2710.5%27%20width%3D%273.2%27%20height%3D%276.6%27%20rx%3D%271%27%20fill%3D%27black%27%2F%3E%3Crect%20x%3D%279.2%27%20y%3D%277.5%27%20width%3D%273.2%27%20height%3D%279.6%27%20rx%3D%271%27%20fill%3D%27black%27%2F%3E%3Crect%20x%3D%2713.4%27%20y%3D%275%27%20width%3D%273.2%27%20height%3D%2712.1%27%20rx%3D%271%27%20fill%3D%27black%27%2F%3E%3Crect%20x%3D%2717.6%27%20y%3D%279%27%20width%3D%273.2%27%20height%3D%278.1%27%20rx%3D%271%27%20fill%3D%27black%27%2F%3E%3C%2Fsvg%3E");
+}
+
+.welcome-task-card[data-task-kind="data_join"] .welcome-task-icon {
+  --welcome-icon-mask-size: 40px 40px;
+  --welcome-icon-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%3E%3Crect%20x%3D%273%27%20y%3D%278%27%20width%3D%2710.5%27%20height%3D%2710.5%27%20rx%3D%273%27%20fill%3D%27black%27%2F%3E%3Crect%20x%3D%276.75%27%20y%3D%276.75%27%20width%3D%2710.5%27%20height%3D%2710.5%27%20rx%3D%273%27%20fill%3D%27black%27%2F%3E%3Crect%20x%3D%2710.5%27%20y%3D%275.5%27%20width%3D%2710.5%27%20height%3D%2710.5%27%20rx%3D%273%27%20fill%3D%27black%27%2F%3E%3C%2Fsvg%3E");
+}
+
+.welcome-task-card[data-task-kind="vintage"] .welcome-task-icon {
+  --welcome-icon-mask-size: 41px 41px;
+  --welcome-icon-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%3E%3Crect%20x%3D%273.5%27%20y%3D%276%27%20width%3D%2717%27%20height%3D%2712.5%27%20rx%3D%272%27%20fill%3D%27black%27%2F%3E%3Cpath%20d%3D%27M7.2%204.8v2.8M16.8%204.8v2.8%27%20stroke%3D%27black%27%20stroke-width%3D%272%27%20stroke-linecap%3D%27round%27%20fill%3D%27none%27%2F%3E%3C%2Fsvg%3E");
+}
+
+.welcome-task-card[data-task-kind="modeling"] .welcome-task-icon {
+  --welcome-icon-mask-size: 36px 36px;
+  --welcome-icon-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%3E%3Crect%20x%3D%272.6%27%20y%3D%274.6%27%20width%3D%2718.8%27%20height%3D%2714.8%27%20rx%3D%272.6%27%20fill%3D%27black%27%2F%3E%3C%2Fsvg%3E");
+}
+
+.welcome-task-card[data-task-kind="validation"] .welcome-task-icon {
+  --welcome-icon-mask-size: 39px 39px;
+  --welcome-icon-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%3E%3Crect%20x%3D%275%27%20y%3D%275%27%20width%3D%2711.5%27%20height%3D%2715.5%27%20rx%3D%272.2%27%20fill%3D%27black%27%2F%3E%3Crect%20x%3D%277%27%20y%3D%273.5%27%20width%3D%2711.5%27%20height%3D%2716%27%20rx%3D%272.2%27%20fill%3D%27black%27%2F%3E%3C%2Fsvg%3E");
+}
+
+.welcome-task-card[data-task-kind="strategy"] .welcome-task-icon {
+  --welcome-icon-mask-size: 43px 43px;
+  --welcome-icon-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%3E%3Crect%20x%3D%274%27%20y%3D%2713.8%27%20width%3D%2716%27%20height%3D%274.6%27%20rx%3D%271.8%27%20fill%3D%27black%27%2F%3E%3Crect%20x%3D%274%27%20y%3D%279.6%27%20width%3D%2716%27%20height%3D%274.6%27%20rx%3D%271.8%27%20fill%3D%27black%27%2F%3E%3Crect%20x%3D%274%27%20y%3D%275%27%20width%3D%2716%27%20height%3D%275.6%27%20rx%3D%271.8%27%20fill%3D%27black%27%2F%3E%3C%2Fsvg%3E");
+}
+
+.welcome-task-card[data-task-kind="portfolio"] .welcome-task-icon {
+  --welcome-icon-mask-size: 41px 41px;
+  --welcome-icon-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%3E%3Ccircle%20cx%3D%2710%27%20cy%3D%2712%27%20r%3D%277.2%27%20fill%3D%27black%27%2F%3E%3Cpath%20d%3D%27M11.5%203.5a8.7%208.7%200%200%201%207.53%2013.05l-2.79-.95A7.2%207.2%200%200%200%2010%204.8Z%27%20fill%3D%27black%27%2F%3E%3C%2Fsvg%3E");
+}
+
+/* back / mid stack layers — OPAQUE lighter shades of the tone (not fill-opacity).
+   Opaque alpha is essential: a translucent fill lets the hover drop-shadow bleed
+   through it and look broken. These mixes match the old translucent look on the
+   card, but the glyph is now a fully solid silhouette so its shadow is clean. */
+.welcome-task-icon svg .back {
+  fill: color-mix(in srgb, var(--tone, var(--accent)) 30%, var(--surface));
+}
+
+.welcome-task-icon svg .mid {
+  fill: color-mix(in srgb, var(--tone, var(--accent)) 62%, var(--surface));
+}
+
+/* cutout details on solid shapes (content lines, etc.) */
+.welcome-task-icon svg .cut {
+  fill: var(--surface);
+}
+
+.welcome-task-icon svg .cs {
+  fill: none;
+  stroke: var(--surface);
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* thinner carved stroke (e.g. the validation seal check) */
+.welcome-task-icon svg .cst {
+  fill: none;
+  stroke: var(--surface);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.welcome-task-icon svg .vintage-calendar-binding {
+  stroke-width: 2;
+}
+
+/* connector lines (e.g. network edges, axes) */
+.welcome-task-icon svg .ln {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* hover: the glyph grows/lifts and casts a SOLID gray shadow offset to the
+   lower-right (Slash behind the back and it's solid gray., like the shield's old back layer); the sheen
+   flashes across once. */
+.welcome-task-card.available:hover .welcome-task-icon {
+  transform: translateY(-3px) scale(1.22);
+}
+
+.welcome-task-card.available:hover .welcome-task-icon svg {
+  filter: drop-shadow(2.5px 3px 0 rgba(17, 20, 32, 0.3));
+}
+
+.welcome-task-card.available:hover .welcome-task-sheen::before {
+  animation: welcome-icon-sheen 560ms ease-out;
+}
+
+
+.welcome-task-card:disabled .welcome-task-icon {
+  color: var(--text-muted);
+}
+
+/* NB: do NOT use ".welcome-task-card span" here — it would override the icon
+   tile's display:inline-flex (the icon is a <span>) and break glyph centering. */
+.welcome-task-card strong {
+  display: block;
+  font-size: 15px;
+}
+
+.welcome-task-card span:not(.welcome-task-icon):not(.welcome-task-sheen) {
+  display: block;
+  max-width: 100%;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.validation-workspace.is-empty .workspace-welcome {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .welcome-task-card,
+  .welcome-task-icon,
+  .welcome-task-icon svg {
+    transition: none;
+  }
+  .welcome-task-card.available:hover,
+  .welcome-task-card.available:hover .welcome-task-icon {
+    transform: none;
+  }
+  .welcome-task-card.available:hover .welcome-task-sheen::before {
+    animation: none;
+  }
+}
+
+@media (max-width: 760px) {
+  .welcome-task-cards {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Temporarily-disabled task types: dimmed with a "Please look forward to it." corner badge. */
+.welcome-task-card.unavailable {
+  opacity: 0.6;
+}
+.welcome-task-card.unavailable::after {
+  content: "Please look forward to it.";
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 2;
+  padding: 2px 9px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--action-on-solid);
+  background: color-mix(in srgb, var(--tone, var(--accent)) 78%, var(--tone-badge-mix));
+}
+
+/* Transient bottom-center toast for the coming-soon notice. */
+.coming-soon-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 32px;
+  transform: translateX(-50%) translateY(12px);
+  z-index: 400;
+  max-width: min(88vw, 420px);
+  padding: 11px 20px;
+  border-radius: 12px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--toast-text);
+  background: var(--toast-bg);
+  box-shadow: var(--toast-shadow);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 200ms ease,
+    transform 200ms ease;
+}
+.coming-soon-toast.is-visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.risk-studio-entry{display:inline-flex;align-items:center;justify-content:space-between;gap:30px;min-width:min(360px,100%);margin:20px 0 6px;padding:14px 17px;border:1px solid color-mix(in srgb,var(--accent) 55%,transparent);border-radius:12px;text-decoration:none;color:var(--text);background:color-mix(in srgb,var(--accent-soft) 35%,var(--surface));transition:transform .2s ease,box-shadow .2s ease}.risk-studio-entry:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,.08)}.risk-studio-entry span:first-child{display:grid;gap:3px}.risk-studio-entry strong{font-size:13px}.risk-studio-entry small{font-size:10px;color:var(--text-muted)}.risk-studio-entry span:last-child{font-size:18px}
