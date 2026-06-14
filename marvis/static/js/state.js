@@ -1,0 +1,124 @@
+const petCatalog = globalThis.MarvisPetCatalog;
+if (!petCatalog) throw new Error("Risk Studio pet catalog must load before state.js");
+
+export const defaultPetPreference = petCatalog.defaultId;
+export const petPreferenceStorageKey = petCatalog.storageKeys.preference;
+export const explicitPetNoneStorageKey = petCatalog.storageKeys.explicitNone;
+export const petPositionStorageKey = petCatalog.storageKeys.position;
+export const agentComposerPreferenceStorageKey = "marvis_agent_composer_preferences";
+export const selectedTaskStorageKey = "marvis_selected_task_id";
+export const resultScrollPositionsStorageKey = "marvis_result_scroll_positions";
+// Per-task composer overrides: `{ [taskId]: { model_id, effort, acceptance_mode } }`.
+// Each task remembers its own mode/model/effort. The global preferences above
+// are only the seed value applied when a task has no override yet.
+export const agentTaskComposerStorageKey = "marvis_agent_task_composer_preferences";
+
+export const defaultBranding = {
+  platformName: "Risk Studio",
+  browserTitle: "Risk Studio",
+  primaryColor: "#317d59",
+  logoUrl: "static/brand/risk-studio-mark.svg",
+  workspaceLogoUrl: "static/brand/risk-studio-mark.svg",
+  faviconUrl: "static/brand/risk-studio-icon-192.png",
+  // Real validator name -> display alias, supplied per-workspace by brand.json.
+  validatorAliases: {},
+};
+
+export const defaultExecutionEnvironment = {
+  execution_mode: "jupyter_kernel",
+  kernel_name: "python3",
+  conda_env_name: "",
+  python_executable: "",
+  // Notebook kernel RSS soft cap (MB). null = no cap (default).
+  notebook_memory_limit_mb: null,
+};
+
+export function createRenderSignatures() {
+  return {
+    actionStatus: "",
+    currentTask: "",
+    taskList: "",
+    workflowStepper: "",
+    metricPreview: "",
+    metricPreviewTaskId: "",
+    // VD-9: gate the databar/KPI-bar entry animation (like the
+    // reproducibility precision-bar below) so it plays only on the first
+    // populated metric render for a given task, not on every polling
+    // rebuild once real data drift changes the signature again.
+    metricPreviewAnimatedTaskId: "",
+    // Reproducibility precision-bar chart lives in a second highly-animated
+    // region. We track its structural signature here (instead of on the DOM
+    // dataset) and gate the CSS entry animation so it only plays for the
+    // first populated render of a given task - not every time a transient
+    // empty evidence payload arrives between populated ones.
+    reproducibilityEvidence: "",
+    reproducibilityEmpty: "",
+    reproducibilityTaskId: "",
+    reproducibilityAnimatedTaskId: "",
+  };
+}
+
+export const activeValidationStatuses = new Set([
+  "created",
+  "scanned",
+  "running",
+  "executed",
+  "computing_metrics",
+  "writing_artifacts",
+]);
+
+export const terminalTaskStatuses = new Set([
+  "succeeded",
+  "failed",
+  "review_required",
+]);
+
+export const notebookReproducibilityCompleteStatuses = new Set([
+  "executed",
+  "computing_metrics",
+  "writing_artifacts",
+  "succeeded",
+  "review_required",
+]);
+
+export const metricOverviewCompleteStatuses = new Set([
+  "writing_artifacts",
+  "succeeded",
+  "review_required",
+]);
+
+export const workflowSteps = [
+  { id: "scan", title: "Input checks", hint: "Check required files", target: "scanSection", action: "scan", actionLabel: "Rescan" },
+  { id: "notebook", title: "Reproducibility", hint: "Run the notebook", target: "notebookSection", action: "notebook", actionLabel: "Run" },
+  { id: "metrics", title: "Performance and stability", hint: "Calculate model metrics", target: "metricSection", action: "metrics", actionLabel: "Generate" },
+  { id: "report", title: "Reports", hint: "Word reports and Excel analysis", target: "reportSection", action: "report", actionLabel: "Generate" },
+];
+
+export const statusLabels = {
+  created: "Created",
+  scanned: "Scanned",
+  running: "Running",
+  executed: "Executed",
+  computing_metrics: "Calculating metrics",
+  writing_artifacts: "Saving outputs",
+  succeeded: "Completed",
+  failed: "Failed",
+  review_required: "Pending review",
+};
+
+export const roleLabels = {
+  notebook: "Notebook",
+  sample: "Sample data",
+  model_pmml: "PMML model",
+  data_dictionary: "Data dictionary",
+  unknown: "Unidentified",
+};
+
+export const requiredMaterialRoles = [
+  { role: "notebook", label: "Notebook" },
+  { role: "sample", label: "Sample data" },
+  { role: "model_pmml", label: "PMML model" },
+  { role: "data_dictionary", label: "Data dictionary" },
+];
+
+export const scanFailurePrefix = "Material scanning failed:";
