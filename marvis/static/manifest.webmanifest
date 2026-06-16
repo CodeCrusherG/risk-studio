@@ -1,0 +1,21 @@
+{
+  "name": "Risk Studio",
+  "short_name": "Risk Studio",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#181818",
+  "theme_color": "#181818",
+  "icons": [
+    {
+      "src": "brand/risk-studio-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "brand/risk-studio-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Risk Studio</title>
+  <link rel="icon" href="/static/brand/risk-studio-icon-192.png">
+  <link rel="stylesheet" href="/static/risk-studio.css">
+  <script src="/static/risk-studio.js" defer></script>
+  <script src="/static/credit-case-study.js" defer></script>
+</head>
+<body data-local-token="__MARVIS_LOCAL_TOKEN__">
+  <div class="shell">
+    <aside class="rail" aria-label="Risk Studio navigation">
+      <a class="brand" href="/risk-studio"><img src="/static/brand/risk-studio-icon-192.png" alt="" width="32" height="32"><span>Risk Studio</span></a>
+      <nav class="nav" aria-label="Analysis areas">
+        <button class="nav-item active" data-view="study" aria-current="page">Observed defaults</button>
+        <button class="nav-item" data-view="overview">Your portfolio</button>
+        <button class="nav-item" data-view="market">FX reference rates</button>
+      </nav>
+      <div class="rail-bottom">
+        <p>Data processing, model development, and validation.</p>
+        <a href="/workbench" class="workbench-link">Open workbench <span aria-hidden="true">↗</span></a>
+      </div>
+    </aside>
+    <main class="main" id="main">
+      <header class="topbar">
+        <span class="breadcrumb" id="breadcrumbCurrent">Observed defaults</span>
+        <div class="top-actions"><button id="exportAnalystReport" class="quiet-button" type="button" disabled hidden>Export portfolio report</button><button id="openSources" class="secondary-button" type="button">Import portfolio</button></div>
+      </header>
+      <div class="content">
+        <section id="studyView" aria-labelledby="creditCaseTitle">
+          <header class="page-heading"><p class="kicker">PUBLIC CREDIT STUDY · UCI · 2005 COHORT</p><h1 id="creditCaseTitle">Observed credit defaults</h1><p>Payment outcomes and model validation for 30,000 Taiwanese credit-card clients.</p></header>
+          <section id="creditCaseStudy" aria-label="Credit study results" tabindex="-1"><div id="creditCaseContent" aria-live="polite"><p class="empty">Loading study results…</p></div></section>
+        </section>
+
+        <section id="portfolioView" hidden aria-labelledby="portfolioTitle">
+          <header class="page-heading"><p class="kicker" id="sourceMode">YOUR DATA</p><h1 id="portfolioTitle">Portfolio analysis</h1><p id="portfolioSourceNote">Analyze counterparty financials, exposures, collateral, and historical returns.</p></header>
+          <div id="portfolioEmpty" class="import-panel"><h2>Import a portfolio</h2><p>Upload a JSON file to calculate exposure, limit utilization, historical VaR, and illustrative margin. The credit study is available separately under Observed defaults.</p><button class="primary-button" id="heroAnalyze" type="button">Choose portfolio data</button></div>
+          <div id="portfolioPanels" hidden>
+            <nav class="portfolio-tabs" aria-label="Portfolio analysis"><button class="nav-item active" data-view="overview">Summary</button><button class="nav-item" data-view="credit">Credit review</button><button class="nav-item" data-view="exposure">Exposure</button><button class="nav-item" data-view="methodology">Methodology</button></nav>
+            <div id="portfolioOverview">
+              <div class="section-head"><h2>Portfolio summary</h2><p id="portfolioCount"></p></div>
+              <section class="metrics" id="metrics" aria-label="Portfolio metrics">
+                <article class="metric"><span>Net exposure</span><strong id="metricExposure">—</strong><small>After collateral, source currency units</small></article>
+                <article class="metric"><span>Limit breaches</span><strong id="metricBreaches">—</strong><small>Counterparties over their limit</small></article>
+                <article class="metric"><span>One-day VaR · 99%</span><strong id="metricVar">—</strong><small>Historical simulation</small></article>
+                <article class="metric"><span>Initial margin</span><strong id="metricMargin">—</strong><small>Illustrative VaR buffer</small></article>
+              </section>
+              <section class="analysis-grid" id="analysisGrid">
+                <article class="panel chart-panel"><h2>Daily portfolio P&amp;L</h2><div class="chart-wrap" id="lossChart" role="img" aria-label="Historical daily portfolio profit and loss"></div><div class="chart-footer"><span>Daily portfolio P&amp;L</span><span id="chartObservations"></span></div></article>
+                <article class="panel"><h2>Items to review</h2><div id="attentionList" class="attention-list"></div><button class="text-link" data-view="exposure" type="button">Review exposures →</button></article>
+              </section>
+            </div>
+            <section class="detail" id="detail" tabindex="-1" aria-live="polite" hidden><div class="detail-heading"><p class="kicker" id="detailKicker"></p><h2 id="detailTitle"></h2><p id="detailIntro"></p></div><div id="detailContent"></div></section>
+            <p class="method-note">Portfolio measures use your imported data. They are illustrative calculations, not approved ratings or regulatory capital measures.</p>
+          </div>
+        </section>
+
+        <section id="marketView" hidden aria-labelledby="marketFeedTitle">
+          <header class="page-heading"><p class="kicker">PUBLIC MARKET DATA · ECB</p><h1 id="marketFeedTitle">FX reference rates</h1><p>Daily exchange rates, quoted per euro.</p></header>
+          <section class="panel market-feed"><div class="panel-top"><span id="marketFeedStatus">Loading rates…</span><button class="text-link" id="refreshMarketFeed" type="button">Refresh</button></div><div id="marketRates" class="market-rates" aria-live="polite"><p class="empty">Loading ECB rates…</p></div><p id="marketFeedTime" class="muted"></p><p class="method-note">Source: <a href="https://data.ecb.europa.eu/data/datasets/EXR" target="_blank" rel="noopener noreferrer">European Central Bank</a>. Reference rates are not executable quotes. They do not alter portfolio calculations.</p></section>
+        </section>
+        <footer class="footer"><span>Risk Studio</span><span>Sources, assumptions, and limitations accompany each analysis.</span></footer>
+      </div>
+    </main>
+  </div>
+  <dialog id="sourceDialog" class="source-dialog" aria-labelledby="sourceTitle"><form method="dialog" class="dialog-head"><h2 id="sourceTitle">Import portfolio</h2><button class="close-button" aria-label="Close dialog">×</button></form><div class="dialog-body"><p>Use your own counterparty financials, positions, collateral, limits, and historical returns. Imported JSON is analyzed in memory.</p><div class="source-actions"><label class="secondary-button upload-button">Choose JSON file<input id="jsonFile" type="file" accept=".json,application/json" hidden></label><button class="secondary-button" id="downloadTemplate" type="button">Download input template</button></div><label for="jsonInput" class="input-label">Portfolio JSON</label><textarea id="jsonInput" spellcheck="false" placeholder="Paste a JSON object with counterparties and positions…"></textarea><p class="field-help">Each position needs at least 30 aligned daily return observations. Use one reporting currency for all amounts.</p><div id="sourceError" class="source-error" role="alert" hidden></div><div class="dialog-footer"><button class="primary-button" id="runAnalysis" type="button">Run analysis</button><button class="quiet-button" id="exportReport" type="button" disabled>Export result JSON</button><button class="quiet-button" id="exportAnalystReportMobile" type="button" disabled>Printable report</button></div></div></dialog>
+</body>
+</html>
