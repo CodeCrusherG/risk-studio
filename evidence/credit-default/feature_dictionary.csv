@@ -1,0 +1,20 @@
+feature,kind
+LIMIT_BAL,observed NT dollar amount
+BILL_AMT1,observed NT dollar amount
+BILL_AMT2,observed NT dollar amount
+BILL_AMT3,observed NT dollar amount
+BILL_AMT4,observed NT dollar amount
+BILL_AMT5,observed NT dollar amount
+BILL_AMT6,observed NT dollar amount
+PAY_AMT1,observed NT dollar amount
+PAY_AMT2,observed NT dollar amount
+PAY_AMT3,observed NT dollar amount
+PAY_AMT4,observed NT dollar amount
+PAY_AMT5,observed NT dollar amount
+PAY_AMT6,observed NT dollar amount
+PAY_0,repayment category
+PAY_2,repayment category
+PAY_3,repayment category
+PAY_4,repayment category
+PAY_5,repayment category
+PAY_6,repayment category

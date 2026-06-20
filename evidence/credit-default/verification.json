@@ -1,0 +1,107 @@
+{
+  "verified_at": "2026-10-03T21:18:38.688283+00:00",
+  "case_study_command": ".venv/bin/python scripts/run_public_credit_case_study.py --offline",
+  "tests": {
+    "command": ".venv/bin/python -m pytest tests/test_credit_case_study.py -q",
+    "result": "9 passed",
+    "duration_seconds": 5.82,
+    "warnings": [
+      "Existing Starlette/httpx deprecation warning"
+    ]
+  },
+  "lint": {
+    "command": ".venv/bin/python -m ruff check marvis/credit_case_study.py marvis/credit_case_api.py scripts/run_public_credit_case_study.py tests/test_credit_case_study.py",
+    "result": "All checks passed"
+  },
+  "javascript_syntax": {
+    "command": "node --check marvis/static/credit-case-study.js",
+    "exit_code": 0
+  },
+  "browser": {
+    "url": "http://127.0.0.1:8093/",
+    "engine": "Playwright Chromium",
+    "viewports": [
+      {
+        "width": 1440,
+        "height": 1080
+      },
+      {
+        "width": 390,
+        "height": 844
+      }
+    ],
+    "page_errors": [],
+    "report_json_download_rows": 30000,
+    "chart_loaded": true,
+    "mobile_horizontal_overflow": false,
+    "screenshots": [
+      "dashboard-desktop.png",
+      "dashboard-mobile.png"
+    ]
+  },
+  "app_integration": {
+    "client": "FastAPI TestClient(create_app(workspace))",
+    "http_200_routes": [
+      "/",
+      "/risk-studio",
+      "/workbench",
+      "/api/risk-studio/credit-case-study",
+      "/api/risk-studio/credit-case-study/artifacts/report.json",
+      "/static/credit-case-study.js"
+    ]
+  },
+  "offline_reproduction": "reproduction_check.json",
+  "interpretation": "Research evidence; browser checks and metric reconciliation are not independent model approval.",
+  "interface_review": {
+    "date_local": "2026-10-04",
+    "javascript_parse": {
+      "parser": "TypeScript createSourceFile parseDiagnostics",
+      "files": 70,
+      "errors": 0
+    },
+    "chromium": {
+      "task_dialogs_opened": 7,
+      "settings_tabs_opened": true,
+      "page_errors": [],
+      "form_render_checks": [
+        "special-value validation",
+        "model setup",
+        "feature selection",
+        "join roles",
+        "table labels",
+        "workflow template form",
+        "import error status"
+      ],
+      "desktop_viewport": {
+        "width": 1440,
+        "height": 1080
+      },
+      "mobile_viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "mobile_horizontal_overflow": false,
+      "screenshots_refreshed": [
+        "dashboard-desktop.png",
+        "dashboard-mobile.png"
+      ]
+    },
+    "redesign": {
+      "default_view": "Observed credit defaults: 30,000 UCI records and visible validation chart",
+      "portfolio_view": "Separate import view; portfolio measures appear after successful analysis",
+      "workbench_desktop_viewport": {
+        "width": 1440,
+        "height": 650
+      },
+      "workbench_mobile_viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "desktop_task_list_wheel_scroll": true,
+      "mobile_horizontal_overflow": false,
+      "mobile_navigation_and_task_dialog_scroll": true,
+      "settings_navigation_and_scroll": true,
+      "public_credit_tests": "9 passed"
+    }
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "case_study_id": "uci-credit-default-v1",
+  "source_archive_sha256": "56c885f84457f6680f8438f02bfcdac9579323d8a94465ee5f26e32baa727602",
+  "code_sha256": {
+    "marvis/credit_case_study.py": "61ba0487da45f709de52e58064947d4f3c93796ac5ed86335e4b00246ad4bf94",
+    "scripts/run_public_credit_case_study.py": "4aa6c12a57a495c003ca17f3ddef38f0b68361bb08d8e9256ebc8782e7494ec6"
+  },
+  "artifacts": {
+    "report.json": {
+      "sha256": "60cb31fc5c08f152c243ba6ce1c7be4e2fbfc26d88314b2e2c1e3fcfe49f0eee",
+      "bytes": 61261
+    },
+    "report.md": {
+      "sha256": "3b6359fafd6709e84453448a4f9085af596bbca98487175dcbcd69bc3d9e59a0",
+      "bytes": 5382
+    },
+    "source_manifest.json": {
+      "sha256": "aa678d32fa4bacc30e2291765da7fd85aa8ca6549ef181da415f258de5b515ec",
+      "bytes": 1224
+    },
+    "predictions.csv": {
+      "sha256": "f23574449136d180f7f7dae3b59f244e6d79d65eab862ea0c3b5e4bbbcd52b20",
+      "bytes": 2976669
+    },
+    "observed_clients.csv": {
+      "sha256": "d1b0f573617ef70b4fe543cfcd6b06bb454a68ebf05be692fb44cc70f75aad73",
+      "bytes": 3203218
+    },
+    "feature_dictionary.csv": {
+      "sha256": "41abd0992884f93ff50b0b911435cb357f12b84fe020e1f11cd067403a60e405",
+      "bytes": 625
+    },
+    "validation.png": {
+      "sha256": "c2b78a45e99a94c5a1ce7ca28cfde0ca97021073c0f65b749033d1b947060623",
+      "bytes": 133479
+    }
+  }
+}

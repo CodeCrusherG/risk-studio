@@ -1,0 +1,19 @@
+{
+  "url": "https://archive.ics.uci.edu/static/public/350/default+of+credit+card+clients.zip",
+  "landing_page": "https://archive.ics.uci.edu/dataset/350/default+of+credit+card+clients",
+  "retrieved_at": "2026-10-03T21:10:50.533251+00:00",
+  "archive_sha256": "56c885f84457f6680f8438f02bfcdac9579323d8a94465ee5f26e32baa727602",
+  "archive_bytes": 5539494,
+  "citation": "Yeh, I. (2009). Default of Credit Card Clients [Dataset]. UCI Machine Learning Repository. https://doi.org/10.24432/C55S3H.",
+  "license": "CC BY 4.0",
+  "license_url": "https://creativecommons.org/licenses/by/4.0/",
+  "source_period": "Payment and bill histories April\u2013September 2005; observed next-month default flag",
+  "data_type": "Observed historical anonymized customer records; probabilities are model estimates.",
+  "workbook_sha256": "30c6be3abd8dcfd3e6096c828bad8c2f011238620f5369220bd60cfc82700933",
+  "transformations": [
+    "Read second Excel row as column headers",
+    "Exclude identifier and demographics from modeling",
+    "Retain original repayment codes, including undocumented -2 and 0, as distinct categories in logistic model",
+    "Derive grouped random partitions and estimated PD; no dates or labels synthesized"
+  ]
+}
