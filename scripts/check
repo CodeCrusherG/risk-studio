@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$ROOT_DIR"
+
+# Keep Matplotlib's font/config cache inside the checkout so repeated test
+# processes reuse it even when the caller's home directory is not writable.
+# An explicit caller value wins, matching Python's ``setdefault`` semantics.
+if [[ -z "${MPLCONFIGDIR+x}" ]]; then
+  MPLCONFIGDIR="$ROOT_DIR/.pytest_cache/matplotlib"
+fi
+export MPLCONFIGDIR
+if [[ -n "$MPLCONFIGDIR" ]]; then
+  mkdir -p -- "$MPLCONFIGDIR"
+fi
+
+if [[ -z "${PYTHON+x}" && -x "$ROOT_DIR/.venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
+else
+  PYTHON_BIN="${PYTHON:-python}"
+fi
+NODE_BIN="${NODE:-node}"
+RUFF_BIN="${RUFF:-}"
+UV_BIN="${UV:-uv}"
+RUN_PYTEST=0
+RUN_RUFF=1
+RUN_NODE=1
+RUN_DIFF=1
+RUN_AUDIT=0
+RUN_BANDIT=1
+FAST=0
+AFFECTED=0
+AFFECTED_FULL=0
+PROFILE=0
+FAST_MARKERS="not slow and not e2e and not llm and not pmml_runtime"
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/check [options] [-- pytest_args...]
+
+Runs source, JavaScript, security, and diff checks used by CI.
+
+Options:
+  --skip-pytest   Skip pytest.
+  --skip-ruff     Skip ruff.
+  --skip-node     Skip JavaScript syntax checks.
+  --skip-diff     Skip git diff whitespace checks.
+  --skip-bandit   Skip the bandit check over changed marvis/*.py files.
+  --fast          Run only the fast test tier
+                  (-m "not slow and not e2e and not llm and not pmml_runtime").
+  --affected      Run tests affected by the current git diff. Uses
+                  CHECK_DIFF_RANGE when set; otherwise checks local changes.
+                  Runs only fast tests and falls back to the fast tier when
+                  mapping is uncertain.
+  --affected-full Run every tier in the affected test files. When mapping is
+                  uncertain, remove the tier filter; explicit pytest selectors
+                  passed after "--" still apply. Use at phase close.
+  --profile       Report the 50 slowest pytest durations (minimum 0.5s).
+                  Compatible with full, fast, affected, and affected-full modes.
+  --audit         Run pip-audit against the locked dependencies (skipped
+                   with a warning if pip-audit is not installed).
+  -h, --help      Show this help.
+
+Environment:
+  PYTHON          Python executable to use. Defaults to "python".
+  NODE            Node.js executable to use. Defaults to "node".
+  RUFF            Ruff executable to use. Defaults to "$PYTHON -m ruff".
+  UV              uv executable used to export the locked audit manifest.
+  CHECK_DIFF_RANGE
+                  Optional git diff range used by --affected and diff checks,
+                  for example origin/main...HEAD.
+
+Pytest arguments may follow "--". Custom -m expressions cannot be combined
+with --fast, --affected, or --affected-full because those modes own test tiers.
+USAGE
+}
+
+PYTEST_ARGS=("-q")
+PYTEST_ARGS_ARE_DEFAULT=1
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skip-pytest)
+      RUN_PYTEST=0
+      shift
+      ;;
+    --skip-ruff)
+      RUN_RUFF=0
+      shift
+      ;;
+    --skip-node)
+      RUN_NODE=0
+      shift
+      ;;
+    --skip-diff)
+      RUN_DIFF=0
+      shift
+      ;;
+    --skip-bandit)
+      RUN_BANDIT=0
+      shift
+      ;;
+    --fast)
+      FAST=1
+      shift
+      ;;
+    --affected)
+      AFFECTED=1
+      shift
+      ;;
+    --affected-full)
+      AFFECTED=1
+      AFFECTED_FULL=1
+      shift
+      ;;
+    --profile)
+      PROFILE=1
+      shift
+      ;;
+    --audit)
+      RUN_AUDIT=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      PYTEST_ARGS=("$@")
+      PYTEST_ARGS_ARE_DEFAULT=0
+      break
+      ;;
+    *)
+      PYTEST_ARGS=("$@")
+      PYTEST_ARGS_ARE_DEFAULT=0
+      break
+      ;;
+  esac
+done
+
+if [[ "$FAST" -eq 1 && "$AFFECTED" -eq 1 ]]; then
+  echo "error: --fast and --affected cannot be used together" >&2
+  exit 2
+fi
+
+if [[ "$RUN_PYTEST" -eq 1 ]] && [[ "$FAST" -eq 1 || "$AFFECTED" -eq 1 ]]; then
+  for pytest_arg in "${PYTEST_ARGS[@]}"; do
+    if [[ "$pytest_arg" == "-m" || "$pytest_arg" == -m?* ]]; then
+      echo "error: custom pytest -m cannot be combined with --fast or --affected" >&2
+      exit 2
+    fi
+  done
+fi
+
+if [[ "$FAST" -eq 1 ]]; then
+  if [[ "$PYTEST_ARGS_ARE_DEFAULT" -eq 1 ]]; then
+    PYTEST_ARGS=("-q" "-m" "$FAST_MARKERS")
+  else
+    PYTEST_ARGS=("-m" "$FAST_MARKERS" "${PYTEST_ARGS[@]}")
+  fi
+fi
+
+if [[ "$AFFECTED" -eq 1 && "$RUN_PYTEST" -eq 1 ]]; then
+  AFFECTED_COMMAND=("$PYTHON_BIN" "scripts/select_affected_tests.py" "--root" "$ROOT_DIR")
+  if [[ -n "${CHECK_DIFF_RANGE:-}" ]]; then
+    AFFECTED_COMMAND+=("--diff-range" "$CHECK_DIFF_RANGE")
+  fi
+  AFFECTED_COMMAND+=("--null")
+  AFFECTED_OUTPUT_FILE="$(mktemp "${TMPDIR:-/tmp}/marvis-affected.XXXXXX")"
+  cleanup_affected_output() {
+    rm -f "$AFFECTED_OUTPUT_FILE"
+  }
+  trap cleanup_affected_output EXIT
+
+  set +e
+  "${AFFECTED_COMMAND[@]}" > "$AFFECTED_OUTPUT_FILE"
+  AFFECTED_STATUS=$?
+  set -e
+  if [[ "$AFFECTED_STATUS" -eq 2 ]]; then
+    if [[ "$AFFECTED_FULL" -eq 0 ]]; then
+      echo "affected mode: mapping uncertain; running fast tier" >&2
+      if [[ "$PYTEST_ARGS_ARE_DEFAULT" -eq 1 ]]; then
+        PYTEST_ARGS=("-q" "-m" "$FAST_MARKERS")
+      else
+        PYTEST_ARGS=("-m" "$FAST_MARKERS" "${PYTEST_ARGS[@]}")
+      fi
+    else
+      echo "affected-full mode: mapping uncertain; running all test tiers" >&2
+    fi
+  elif [[ "$AFFECTED_STATUS" -ne 0 ]]; then
+    echo "error: affected-test selector failed with status $AFFECTED_STATUS" >&2
+    exit "$AFFECTED_STATUS"
+  elif [[ ! -s "$AFFECTED_OUTPUT_FILE" ]]; then
+    RUN_PYTEST=0
+  else
+    AFFECTED_TESTS=()
+    while IFS= read -r -d '' test_path; do
+      [[ -n "$test_path" ]] && AFFECTED_TESTS+=("$test_path")
+    done < "$AFFECTED_OUTPUT_FILE"
+    PYTEST_ARGS=("${AFFECTED_TESTS[@]}" "${PYTEST_ARGS[@]}")
+    if [[ "$AFFECTED_FULL" -eq 0 ]]; then
+      PYTEST_ARGS+=("-m" "$FAST_MARKERS")
+    fi
+  fi
+  cleanup_affected_output
+  trap - EXIT
+fi
+
+if [[ "$RUN_PYTEST" -eq 1 && "$PROFILE" -eq 1 ]]; then
+  PYTEST_ARGS+=("--durations=50" "--durations-min=0.5")
+fi
+
+if [[ "$RUN_DIFF" -eq 1 ]]; then
+  echo "==> git diff --check"
+  if [[ -n "${CHECK_DIFF_RANGE:-}" ]]; then
+    DIFF_BASE="${CHECK_DIFF_RANGE%%...*}"
+    DIFF_BASE="${DIFF_BASE%%..*}"
+    if git rev-parse --verify --quiet "${DIFF_BASE}^{commit}" >/dev/null; then
+      git diff --check "$CHECK_DIFF_RANGE"
+    else
+      echo "warning: CHECK_DIFF_RANGE base not found ($CHECK_DIFF_RANGE); checking HEAD commit instead" >&2
+      git diff-tree --check --no-commit-id --root -r HEAD
+    fi
+  else
+    git diff --check
+  fi
+fi
+
+if [[ "$RUN_RUFF" -eq 1 ]]; then
+  echo "==> ruff"
+  if [[ -n "$RUFF_BIN" ]]; then
+    "$RUFF_BIN" check marvis scripts --extend-exclude '*.ipynb'
+  else
+    "$PYTHON_BIN" -m ruff check marvis scripts --extend-exclude '*.ipynb'
+  fi
+fi
+
+if [[ "$RUN_NODE" -eq 1 ]]; then
+  echo "==> node --check"
+  while IFS= read -r -d '' js_file; do
+    "$NODE_BIN" --check "$js_file"
+  done < <(find marvis/static -type f -name '*.js' -print0 | sort -z)
+fi
+
+if [[ "$RUN_BANDIT" -eq 1 ]]; then
+  echo "==> bandit (changed marvis/*.py files)"
+  if "$PYTHON_BIN" -m bandit --version >/dev/null 2>&1; then
+    if [[ -n "${CHECK_DIFF_RANGE:-}" ]]; then
+      BANDIT_BASE="${CHECK_DIFF_RANGE%%...*}"
+      BANDIT_BASE="${BANDIT_BASE%%..*}"
+    else
+      BANDIT_BASE="HEAD"
+    fi
+    changed_py=()
+    while IFS= read -r f; do
+      [[ -n "$f" ]] && [[ -f "$f" ]] && changed_py+=("$f")
+    done < <(
+      {
+        git diff --name-only "$BANDIT_BASE" -- marvis
+        git ls-files --others --exclude-standard -- marvis
+      } | grep '\.py$' | sort -u || true
+    )
+    if [[ ${#changed_py[@]} -gt 0 ]]; then
+      "$PYTHON_BIN" scripts/check_bandit.py "${changed_py[@]}"
+    else
+      echo "no changed marvis/*.py files"
+    fi
+  else
+    echo "skipping bandit: not installed (pip install bandit to enable)"
+  fi
+fi
+
+if [[ "$RUN_PYTEST" -eq 1 ]]; then
+  echo "==> pytest ${PYTEST_ARGS[*]}"
+  set +e
+  "$PYTHON_BIN" -m pytest "${PYTEST_ARGS[@]}"
+  PYTEST_STATUS=$?
+  set -e
+  if [[ "$PYTEST_STATUS" -eq 5
+    && "$AFFECTED" -eq 1
+    && "$AFFECTED_FULL" -eq 0
+    && "$PYTEST_ARGS_ARE_DEFAULT" -eq 1
+  ]]; then
+    echo "affected mode: no fast tests selected; use --affected-full for excluded tiers" >&2
+  elif [[ "$PYTEST_STATUS" -ne 0 ]]; then
+    exit "$PYTEST_STATUS"
+  fi
+fi
+
+if [[ "$RUN_AUDIT" -eq 1 ]]; then
+  echo "==> pip-audit"
+  if "$PYTHON_BIN" -m pip_audit --version >/dev/null 2>&1; then
+    if ! command -v "$UV_BIN" >/dev/null 2>&1; then
+      echo "error: uv is required to audit the locked dependencies" >&2
+      exit 1
+    fi
+    # Audit the exact lockfile resolution, rather than the caller's ambient
+    # interpreter. Hashes and --disable-pip ensure pip-audit does not resolve
+    # a different dependency graph while it scans the pinned requirements.
+    "$UV_BIN" export --locked --all-extras --all-groups --no-emit-project \
+      --format requirements.txt \
+      | "$PYTHON_BIN" -m pip_audit --require-hashes --disable-pip -r /dev/stdin
+  else
+    echo "skipping pip-audit: not installed (pip install pip-audit to enable --audit)"
+  fi
+fi

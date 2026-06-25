@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv (with cache)
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev
+      - name: Run source and static checks
+        env:
+          CHECK_DIFF_RANGE: ${{ github.event_name == 'pull_request' && format('{0}...HEAD', github.event.pull_request.base.sha) || 'HEAD~1..HEAD' }}
+        run: uv run scripts/check --skip-pytest
+
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: false
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv (with cache)
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev
+      - name: pip-audit dependency scan
+        run: >-
+          uv export --locked --all-extras --all-groups --no-emit-project --format requirements.txt
+          | uv tool run --from pip-audit==2.10.1 pip-audit --require-hashes --disable-pip -r /dev/stdin
+      - name: bandit source scan
+        run: uv tool run --from bandit==1.9.4 bandit -r marvis -ll -ii -b .bandit-baseline.json
