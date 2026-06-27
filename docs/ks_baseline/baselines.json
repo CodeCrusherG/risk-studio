@@ -1,0 +1,48 @@
+{
+  "_meta": {
+    "description": "Ground-truth KS baselines for the T4-2 end-to-end harness. Each dataset's baseline_ks is a one-off, human-tuned KS captured as ground truth; the agent's run_ks output PASSES when agent_ks >= baseline_ks - tolerance. See docs/ks_baseline/README.md.",
+    "default_tolerance": 0.005,
+    "metric": "test_ks",
+    "plan_ref": "docs/plans/v2-trust-first-plan.md §0 / T4"
+  },
+  "synthetic_smoke": {
+    "baseline_ks": 0.40,
+    "recipe": "lr",
+    "note": "CI smoke ANCHOR only — a conservative floor on the built-in deterministic synthetic dataset (marvis.sample_data.generate_sample_frame, n_rows=2000, seed=20260701). NOT a KS-standard: it proves the harness runs end-to-end, not that the agent meets a public benchmark. Observed test_ks is ~0.66; the floor is set low so the anchor is stable across minor LR changes.",
+    "provenance": {
+      "dataset": "marvis.sample_data.generate_sample_frame",
+      "n_rows": 2000,
+      "seed": 20260701,
+      "split": "positional 60/20/20 (deterministic)",
+      "tuned_by": "harness author (conservative floor, not a tuning run)"
+    }
+  },
+  "give_me_some_credit": {
+    "status": "blocked_missing_dataset_and_baseline",
+    "baseline_ks": null,
+    "recipe": "lgb",
+    "note": "BLOCKED — 2026-07-24 read-only search found no cs-training.csv in the worktree/workspace or configured local data-staging locations. Do not substitute the synthetic anchor. Supply the licensed file and run the traceable --record command in docs/ks_baseline/README.md. Target: SeriousDlqin2yrs.",
+    "provenance": {
+      "dataset": "Kaggle: GiveMeSomeCredit (cs-training.csv)",
+      "target_col": "SeriousDlqin2yrs",
+      "n_rows": null,
+      "seed": null,
+      "split": null,
+      "tuned_by": null
+    }
+  },
+  "home_credit": {
+    "status": "blocked_missing_dataset_and_baseline",
+    "baseline_ks": null,
+    "recipe": "lgb",
+    "note": "BLOCKED — 2026-07-24 read-only search found no application_train.csv in the worktree/workspace or configured local data-staging locations. Do not substitute the synthetic anchor. Supply the licensed file and run the traceable --record command in docs/ks_baseline/README.md. Target: TARGET.",
+    "provenance": {
+      "dataset": "Kaggle: Home Credit Default Risk (application_train.csv)",
+      "target_col": "TARGET",
+      "n_rows": null,
+      "seed": null,
+      "split": null,
+      "tuned_by": null
+    }
+  }
+}
