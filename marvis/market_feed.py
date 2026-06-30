@@ -27,7 +27,8 @@ _lock = Lock()
 
 def _fetch_rates() -> dict:
     request = Request(ECB_URL, headers={"Accept": "text/csv", "User-Agent": "RiskStudio/2.5"})
-    with urlopen(request, timeout=8, context=ssl.create_default_context(cafile=certifi.where())) as response:
+    # ECB_URL is a fixed HTTPS endpoint, never supplied by a caller.
+    with urlopen(request, timeout=8, context=ssl.create_default_context(cafile=certifi.where())) as response:  # nosec B310
         data = response.read(1_000_001)
     if len(data) > 1_000_000:
         raise ValueError("ECB response exceeded the size limit")

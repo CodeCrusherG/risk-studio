@@ -63,7 +63,8 @@ def load_source(cache: Path, *, offline: bool = False) -> tuple[pd.DataFrame, di
             raise FileNotFoundError("No cached UCI source; run once without --offline.")
         req = Request(SOURCE_URL, headers={"User-Agent": "RiskStudio-public-research/1.0"})
         context = ssl.create_default_context(cafile=certifi.where())
-        with urlopen(req, timeout=60, context=context) as response:
+        # SOURCE_URL is a fixed HTTPS endpoint, never supplied by a caller.
+        with urlopen(req, timeout=60, context=context) as response:  # nosec B310
             body = response.read(10_000_001)
         if len(body) > 10_000_000 or hashlib.sha256(body).hexdigest() != SOURCE_SHA256:
             raise ValueError("UCI source checksum changed; review source before updating the pin.")
