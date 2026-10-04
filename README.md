@@ -12,7 +12,7 @@ Risk Studio combines a risk dashboard with an AI-assisted workbench. The dashboa
 
 | Pair | Contributors | Responsibility |
 |---|---|---|
-| Pair 1 | [Gopesh (@CodeCrusherG)](https://github.com/CodeCrusherG) and [Prateek (@PrateekIITMandi)](https://github.com/PrateekIITMandi) | Data preparation and model development |
+| Pair 1 | [Gopesh (@CodeCrusherG)](https://github.com/CodeCrusherG)  | Data preparation and model development |
 | Pair 2 | [Manav (@manav-bidawat)](https://github.com/manav-bidawat) and [Abhay (@immortal-coder-abhay)](https://github.com/immortal-coder-abhay) | Model validation and strategy workflows |
 
 ## Explore the dashboard
